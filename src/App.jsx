@@ -681,7 +681,7 @@ const STYLES = `
 // with 100k+ strokes.
 const FrameView = forwardRef(function FrameView(
   {
-    frame, isSelected, showDimensions, drawWithFinger,
+    frame, isSelected, showDimensions,
     getBlockBitmap,
     onSelect,
     onPointerDown, onPointerMove, onPointerUp,
@@ -758,7 +758,6 @@ const FrameView = forwardRef(function FrameView(
   useImperativeHandle(ref, () => ({ redraw }), [redraw]);
 
   const handleDown = (e) => {
-    if (e.pointerType === 'touch' && !drawWithFinger) return;
     onSelect(frame.id);
     onPointerDown(e, frame.id, canvasRef.current);
   };
@@ -787,7 +786,7 @@ const FrameView = forwardRef(function FrameView(
         <canvas
           ref={canvasRef}
           className="conti-frame-canvas"
-          style={{ touchAction: drawWithFinger ? 'none' : 'pan-y pan-x' }}
+          style={{ touchAction: 'none' }}
           onPointerDown={handleDown}
           onPointerMove={(e) => onPointerMove(e, canvasRef.current)}
           onPointerUp={(e) => onPointerUp(e, canvasRef.current)}
@@ -844,11 +843,15 @@ export default function ContiProgram() {
   // Pen state — global across frames.
   const [penSize, setPenSize] = useState(4);
   const [penOpacity, setPenOpacity] = useState(100);
-  const [drawWithFinger, setDrawWithFinger] = useState(true);
 
   // Drawing in-progress state.
   const drawingRef = useRef(null); // { frameId } | null
   const currentStrokeRef = useRef(null);
+
+  // Multi-touch pan tracking.
+  const canvasAreaRef = useRef(null);
+  const activeTouchPointersRef = useRef(new Map()); // pointerId -> {x, y}
+  const panStateRef = useRef(null); // {lastX, lastY} | null
 
   // Imperative handles to each FrameView so we can trigger redraws when
   // strokes change (since strokes live in a ref, not state).
@@ -951,6 +954,31 @@ export default function ContiProgram() {
   };
 
   const handlePointerDown = (e, frameId, canvasEl) => {
+    // --- Two-finger pan (touch only) ---
+    if (e.pointerType === 'touch') {
+      activeTouchPointersRef.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
+      if (activeTouchPointersRef.current.size >= 2) {
+        // Cancel any stroke in progress when the 2nd finger lands
+        if (drawingRef.current) {
+          const cancelledFrameId = drawingRef.current.frameId;
+          drawingRef.current = null;
+          currentStrokeRef.current = null;
+          // Redraw to clear the in-progress stroke visuals
+          frameRefs.current[cancelledFrameId]?.redraw();
+        }
+        // Start pan tracking
+        if (!panStateRef.current) {
+          const pts = [...activeTouchPointersRef.current.values()];
+          const avgX = pts.reduce((s, p) => s + p.x, 0) / pts.length;
+          const avgY = pts.reduce((s, p) => s + p.y, 0) / pts.length;
+          panStateRef.current = { lastX: avgX, lastY: avgY };
+        }
+        try { canvasEl?.releasePointerCapture(e.pointerId); } catch (_) {}
+        return;
+      }
+    }
+
+    // --- Single touch or pen: draw ---
     e.preventDefault();
     const frame = frames.find((f) => f.id === frameId);
     if (!frame || !canvasEl) return;
@@ -970,6 +998,27 @@ export default function ContiProgram() {
   };
 
   const handlePointerMove = (e, canvasEl) => {
+    // --- Two-finger pan ---
+    if (e.pointerType === 'touch') {
+      if (activeTouchPointersRef.current.has(e.pointerId)) {
+        activeTouchPointersRef.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
+      }
+      if (activeTouchPointersRef.current.size >= 2) {
+        if (panStateRef.current && canvasAreaRef.current) {
+          const pts = [...activeTouchPointersRef.current.values()];
+          const avgX = pts.reduce((s, p) => s + p.x, 0) / pts.length;
+          const avgY = pts.reduce((s, p) => s + p.y, 0) / pts.length;
+          const dx = avgX - panStateRef.current.lastX;
+          const dy = avgY - panStateRef.current.lastY;
+          canvasAreaRef.current.scrollLeft -= dx;
+          canvasAreaRef.current.scrollTop -= dy;
+          panStateRef.current = { lastX: avgX, lastY: avgY };
+        }
+        return;
+      }
+    }
+
+    // --- Drawing ---
     if (!drawingRef.current || !canvasEl) return;
     e.preventDefault();
     const frame = frames.find((f) => f.id === drawingRef.current.frameId);
@@ -990,6 +1039,16 @@ export default function ContiProgram() {
   };
 
   const handlePointerUp = (e, canvasEl) => {
+    // --- Touch pointer cleanup ---
+    if (e.pointerType === 'touch') {
+      activeTouchPointersRef.current.delete(e.pointerId);
+      if (activeTouchPointersRef.current.size < 2) {
+        panStateRef.current = null;
+      }
+      // If we were in pan mode (not drawing), exit early
+      if (!drawingRef.current) return;
+    }
+
     if (!drawingRef.current) return;
     const drawState = drawingRef.current;
     drawingRef.current = null;
@@ -1380,13 +1439,6 @@ export default function ContiProgram() {
         </div>
 
         <div className="conti-actions">
-          <button
-            className={`conti-icon-btn ${drawWithFinger ? 'active' : ''}`}
-            onClick={() => setDrawWithFinger((v) => !v)}
-            title="finger draw 켜면 손가락으로도 그려짐 / 끄면 손가락은 스크롤만"
-          >
-            {drawWithFinger ? '✓ ' : ''}finger draw
-          </button>
           <button className="conti-icon-btn" onClick={undo} disabled={!selectedFrame}>↶ undo</button>
           <button className="conti-icon-btn danger" onClick={clearAll} disabled={!selectedFrame}>clear all</button>
         </div>
@@ -1491,7 +1543,7 @@ export default function ContiProgram() {
         </aside>
 
         {/* canvas area */}
-        <div className="conti-canvas-area">
+        <div className="conti-canvas-area" ref={canvasAreaRef}>
           <div className="conti-canvas-inner">
             {frames.map((f) => (
               <FrameView
@@ -1503,7 +1555,6 @@ export default function ContiProgram() {
                 frame={f}
                 isSelected={f.id === selectedFrameId}
                 showDimensions={f.id === selectedFrameId}
-                drawWithFinger={drawWithFinger}
                 getBlockBitmap={getBlockBitmapRef.current[f.id]}
                 onSelect={setSelectedFrameId}
                 onPointerDown={handlePointerDown}
