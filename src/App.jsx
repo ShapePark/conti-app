@@ -1,6 +1,6 @@
 import React, {
   useState, useRef, useLayoutEffect, useMemo, useCallback,
-  forwardRef, useImperativeHandle,
+  useEffect, forwardRef, useImperativeHandle,
 } from 'react';
 
 // ---------- ids ----------
@@ -17,14 +17,16 @@ const sizeToSlider = (sz) => 100 * Math.log(sz / PEN_MIN) / Math.log(PEN_MAX / P
 const DEFAULT_VERTICAL_SIZES = [200, 300, 400, 600, 800, 1000, 1200];
 const DEFAULT_GAP_SIZES = [200, 400, 600, 800, 1000];
 const CUT_STROKE_HALO = 200;
-
-// Per-block bitmap cache: each block's offscreen canvas is taller than the
-// block itself so strokes that extend slightly outside still fit. y=0 in the
-// stroke's local coords lands at y=BITMAP_Y_PADDING in the bitmap canvas.
 const BITMAP_Y_PADDING = 200;
-const BITMAP_GROW_CHUNK = 400; // round up bitmap growth in chunks
+const BITMAP_GROW_CHUNK = 400;
 const DPR_CAP = 2;
-const RDP_EPSILON = 0.5; // px, point simplification tolerance
+const RDP_EPSILON = 0.5;
+
+// ---------- lasso constants ----------
+const HANDLE_SIZE = 9;
+const HANDLE_HIT_RADIUS = 14;
+const ROTATE_HANDLE_DIST = 32;
+const LASSO_COLOR = '#c43a2c';
 
 // ---------- helpers ----------
 const computeBlockTops = (arr) => {
@@ -37,7 +39,6 @@ const computeBlockTops = (arr) => {
   return tops;
 };
 
-// Same association rule as before — cut + 200px halo wins over gap.
 const findStrokeBlockId = (stroke, arr, tops) => {
   if (!stroke.points || stroke.points.length === 0) return null;
   const sortedY = stroke.points.map((p) => p.y).sort((a, b) => a - b);
@@ -66,8 +67,6 @@ const findStrokeBlockId = (stroke, arr, tops) => {
   return null;
 };
 
-// Compute a stroke's axis-aligned bounding box (in whatever coords its
-// points use — we store strokes in block-local coords).
 const computeBbox = (points) => {
   let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
   for (const p of points) {
@@ -79,8 +78,6 @@ const computeBbox = (points) => {
   return { minX, minY, maxX, maxY };
 };
 
-// Iterative Ramer–Douglas–Peucker. Drops collinear points within `epsilon`,
-// usually cutting raw pointer samples by 60–80% with no visible change.
 const rdpSimplify = (points, epsilon) => {
   if (points.length <= 2) return points;
   const keep = new Uint8Array(points.length);
@@ -119,9 +116,6 @@ const rdpSimplify = (points, epsilon) => {
   return out;
 };
 
-// Apply stroke style + draw onto a 2D context. `yShift` is added to every
-// point's y — used both for blitting block-local strokes onto a bitmap (which
-// has BITMAP_Y_PADDING headroom) and for any one-off frame-coord renders.
 const renderStrokeToCtx = (ctx, stroke, yShift = 0) => {
   if (!stroke.points || stroke.points.length === 0) return;
   ctx.strokeStyle = `rgba(15, 15, 15, ${stroke.opacity})`;
@@ -141,9 +135,6 @@ const renderStrokeToCtx = (ctx, stroke, yShift = 0) => {
   ctx.stroke();
 };
 
-// Per-block offscreen bitmap. Coordinates: a stroke's local y of 0 maps to
-// canvas y = BITMAP_Y_PADDING. Width = frame.canvasWidth. Height grows on
-// demand if a stroke extends beyond the current bitmap.
 const createBlockBitmap = (logicalWidth, logicalHeight, dpr) => {
   const canvas = document.createElement('canvas');
   const w = Math.max(1, Math.ceil(logicalWidth * dpr));
@@ -158,9 +149,7 @@ const createBlockBitmap = (logicalWidth, logicalHeight, dpr) => {
   return { canvas, ctx, logicalWidth, logicalHeight, dpr };
 };
 
-// Blit `src` bitmap onto `dst` (used to copy contents into a resized bitmap).
 const blitBitmap = (srcEntry, dstCtx) => {
-  // Both bitmaps are dpr-scaled; drawImage with the logical size handles it.
   dstCtx.drawImage(
     srcEntry.canvas,
     0, 0,
@@ -168,17 +157,78 @@ const blitBitmap = (srcEntry, dstCtx) => {
   );
 };
 
-const makeStarterFrame = (name, opts = {}) => ({
-  id: newId(),
-  name,
-  canvasWidth: opts.canvasWidth ?? 690,
-  sideMargin: opts.sideMargin ?? 38,
-  blocks: opts.blocks ?? [
-    { id: newId(), type: 'cut', height: 600 },
-    { id: newId(), type: 'gap', height: 200 },
-    { id: newId(), type: 'cut', height: 800 },
-  ],
-});
+// ---------- lasso helpers ----------
+const pointInPolygon = (px, py, polygon) => {
+  if (polygon.length < 3) return false;
+  let inside = false;
+  for (let i = 0, j = polygon.length - 1; i < polygon.length; j = i++) {
+    const xi = polygon[i].x, yi = polygon[i].y;
+    const xj = polygon[j].x, yj = polygon[j].y;
+    const intersect = ((yi > py) !== (yj > py))
+      && (px < (xj - xi) * (py - yi) / (yj - yi) + xi);
+    if (intersect) inside = !inside;
+  }
+  return inside;
+};
+
+// Apply selection transform: flip→scale→rotate→translate, all relative to bbox center
+const applySelectionTransform = (x, y, cx, cy, tr) => {
+  let lx = x - cx, ly = y - cy;
+  if (tr.flipH) lx = -lx;
+  if (tr.flipV) ly = -ly;
+  lx *= tr.scaleX; ly *= tr.scaleY;
+  const cos = Math.cos(tr.angle), sin = Math.sin(tr.angle);
+  const rx = lx * cos - ly * sin, ry = lx * sin + ly * cos;
+  return { x: rx + cx + tr.tx, y: ry + cy + tr.ty };
+};
+
+const getHandlePositions = (bbox, tr) => {
+  const { minX, minY, maxX, maxY, cx, cy } = bbox;
+  const t = (x, y) => applySelectionTransform(x, y, cx, cy, tr);
+  const tl = t(minX, minY);
+  const tr2 = t(maxX, minY);
+  const br = t(maxX, maxY);
+  const bl = t(minX, maxY);
+  const tc = { x: (tl.x + tr2.x) / 2, y: (tl.y + tr2.y) / 2 };
+  const bc = { x: (bl.x + br.x) / 2, y: (bl.y + br.y) / 2 };
+  const lc = { x: (tl.x + bl.x) / 2, y: (tl.y + bl.y) / 2 };
+  const rc = { x: (tr2.x + br.x) / 2, y: (tr2.y + br.y) / 2 };
+  // Rotation handle: away from center along the "up" direction of the bbox
+  const outX = tc.x - bc.x, outY = tc.y - bc.y;
+  const outLen = Math.sqrt(outX * outX + outY * outY) || 1;
+  const rotate = {
+    x: tc.x + (outX / outLen) * ROTATE_HANDLE_DIST,
+    y: tc.y + (outY / outLen) * ROTATE_HANDLE_DIST,
+  };
+  return { tl, tr: tr2, br, bl, tc, bc, lc, rc, rotate };
+};
+
+const hitTestHandles = (px, py, handles) => {
+  const r2 = HANDLE_HIT_RADIUS * HANDLE_HIT_RADIUS;
+  // Rotation handle first
+  const rot = handles.rotate;
+  if ((px - rot.x) ** 2 + (py - rot.y) ** 2 <= r2) return 'rotate';
+  for (const name of ['tl', 'tr', 'br', 'bl', 'tc', 'bc', 'lc', 'rc']) {
+    const h = handles[name];
+    if ((px - h.x) ** 2 + (py - h.y) ** 2 <= r2) return name;
+  }
+  return null;
+};
+
+const makeStarterFrame = (name, opts = {}) => {
+  const sm = opts.sideMargin ?? 38;
+  return {
+    id: newId(),
+    name,
+    canvasWidth: opts.canvasWidth ?? 690,
+    sideMargin: sm,
+    blocks: opts.blocks ?? [
+      { id: newId(), type: 'cut', height: 600, marginLeft: sm, marginRight: sm },
+      { id: newId(), type: 'gap', height: 200 },
+      { id: newId(), type: 'cut', height: 800, marginLeft: sm, marginRight: sm },
+    ],
+  };
+};
 
 // ---------- CSS ----------
 const STYLES = `
@@ -220,9 +270,10 @@ const STYLES = `
   padding: 0 18px;
   background: var(--bg);
   border-bottom: 1px solid var(--line);
-  gap: 24px;
+  gap: 16px;
+  overflow: hidden;
 }
-.conti-brand { display: flex; align-items: center; gap: 10px; }
+.conti-brand { display: flex; align-items: center; gap: 10px; flex-shrink: 0; }
 .conti-brand-mark {
   width: 22px; height: 22px; border-radius: 50%;
   background: var(--ink); position: relative;
@@ -235,16 +286,22 @@ const STYLES = `
 .conti-brand-name { font-weight: 700; font-size: 15px; letter-spacing: -0.01em; }
 .conti-brand-version { font-family: 'JetBrains Mono', monospace; font-size: 10px; color: var(--muted); margin-top: 1px; }
 
-.conti-tools { display: flex; align-items: center; gap: 18px; flex: 1; }
-.conti-tool { display: flex; align-items: center; gap: 8px; }
+.conti-tools { display: flex; align-items: center; gap: 14px; flex: 1; min-width: 0; }
+.conti-tool { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
+.conti-tool-sep {
+  width: 1px; height: 24px;
+  background: var(--line);
+  flex-shrink: 0;
+}
 .conti-tool-label {
   font-family: 'JetBrains Mono', monospace;
   font-size: 10px; letter-spacing: 0.08em;
   color: var(--muted); text-transform: uppercase;
+  flex-shrink: 0;
 }
 .conti-tool input[type="range"] {
   -webkit-appearance: none; appearance: none;
-  width: 110px; height: 4px;
+  width: 100px; height: 4px;
   background: var(--line); border-radius: 999px;
   outline: none;
 }
@@ -262,7 +319,7 @@ const STYLES = `
   box-shadow: 0 0 0 1px var(--ink);
 }
 .conti-num {
-  width: 60px; padding: 4px 6px;
+  width: 56px; padding: 4px 6px;
   font-family: 'JetBrains Mono', monospace;
   font-size: 12px;
   background: var(--paper);
@@ -287,10 +344,10 @@ const STYLES = `
 }
 .conti-pen-dot { border-radius: 50%; background: var(--ink); }
 
-.conti-actions { display: flex; align-items: center; gap: 6px; }
+.conti-actions { display: flex; align-items: center; gap: 6px; flex-shrink: 0; }
 .conti-icon-btn {
-  display: flex; align-items: center; gap: 6px;
-  padding: 6px 10px;
+  display: flex; align-items: center; gap: 5px;
+  padding: 5px 9px;
   font-family: 'JetBrains Mono', monospace;
   font-size: 11px; letter-spacing: 0.04em;
   color: var(--ink-2);
@@ -299,12 +356,32 @@ const STYLES = `
   border-radius: 5px;
   transition: all 0.12s ease;
   text-transform: lowercase;
+  white-space: nowrap;
+  flex-shrink: 0;
 }
 .conti-icon-btn:hover:not(:disabled) { background: var(--bg-panel); border-color: var(--line); }
 .conti-icon-btn:active:not(:disabled) { transform: translateY(1px); }
 .conti-icon-btn:disabled { opacity: 0.35; cursor: not-allowed; }
 .conti-icon-btn.active { background: var(--ink); color: var(--paper); border-color: var(--ink); }
 .conti-icon-btn.danger:hover:not(:disabled) { color: var(--accent); border-color: var(--accent); }
+.conti-icon-btn.accent { background: var(--accent); color: var(--paper); border-color: var(--accent); }
+
+/* selection action bar */
+.conti-sel-bar {
+  display: flex; align-items: center; gap: 4px;
+  padding: 3px 8px;
+  background: var(--accent-soft);
+  border: 1px solid rgba(196,58,44,0.25);
+  border-radius: 6px;
+  flex-shrink: 0;
+}
+.conti-sel-bar .conti-sel-label {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 10px; letter-spacing: 0.1em;
+  color: var(--accent);
+  text-transform: uppercase;
+  margin-right: 4px;
+}
 
 /* main */
 .conti-main { display: flex; flex: 1; min-height: 0; }
@@ -504,8 +581,17 @@ const STYLES = `
 .conti-frame-canvas {
   position: absolute; top: 0; left: 0;
   display: block;
-  cursor: crosshair;
+  pointer-events: none;
 }
+/* Overlay canvas: sits on top, handles all events */
+.conti-frame-overlay {
+  position: absolute; top: 0; left: 0;
+  display: block;
+  z-index: 5;
+}
+.conti-frame-overlay.tool-pen { cursor: crosshair; }
+.conti-frame-overlay.tool-lasso { cursor: cell; }
+.conti-frame-overlay.tool-lasso-selected { cursor: move; }
 
 /* dimension labels */
 .conti-dim {
@@ -642,7 +728,45 @@ const STYLES = `
   border-radius: 5px;
 }
 
-/* status */
+/* margin sub-row (right sidebar, cut blocks only) */
+.conti-block-margin-row {
+  display: flex; align-items: center; gap: 4px;
+  padding: 4px 8px 6px 8px;
+  margin-top: -6px;
+  margin-bottom: 4px;
+  background: var(--bg-panel);
+  border: 1px solid var(--line);
+  border-top: none;
+  border-radius: 0 0 5px 5px;
+}
+.conti-margin-label {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 9px; letter-spacing: 0.06em;
+  color: var(--muted); text-transform: uppercase;
+  flex-shrink: 0; width: 10px; text-align: center;
+}
+.conti-margin-sep {
+  flex: 1;
+  height: 1px;
+  background: var(--line);
+}
+.conti-block-margin-row input {
+  width: 42px; padding: 2px 4px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 10px;
+  background: var(--paper);
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  text-align: right;
+  color: var(--ink);
+  flex-shrink: 0;
+}
+.conti-block-margin-row input:focus { outline: none; border-color: var(--ink); }
+
+/* tweak: cut block row gets a flat bottom when margin row follows */
+.conti-block-row.has-margin { border-radius: 5px 5px 0 0; margin-bottom: 0; }
+
+
 .conti-status {
   position: fixed; bottom: 12px; left: 50%;
   transform: translateX(-50%);
@@ -659,29 +783,44 @@ const STYLES = `
   z-index: 10;
 }
 .conti-status .dot { width: 6px; height: 6px; background: #6fc275; border-radius: 50%; align-self: center; }
+.conti-status .dot.lasso { background: var(--accent); }
+
+/* viewport-active block highlight (right sidebar) */
+.conti-block-row.viewport-active {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  box-shadow: inset 3px 0 0 var(--accent);
+}
+.conti-block-row.viewport-active .conti-block-tag.cut {
+  background: var(--accent);
+}
+.conti-block-row.viewport-active .conti-block-tag.gap {
+  background: var(--accent);
+  color: var(--paper);
+}
+.conti-block-row.viewport-active input {
+  color: var(--accent);
+  font-weight: 600;
+}
+.conti-block-margin-row.viewport-active {
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent-soft) 60%, var(--bg-panel));
+  box-shadow: inset 3px 0 0 var(--accent);
+}
 
 @media (max-width: 900px) {
   .conti-sidebar.right { display: none; }
 }
 @media (max-width: 700px) {
   .conti-sidebar { width: 200px; flex: 0 0 200px; }
-  .conti-tool input[type="range"] { width: 80px; }
+  .conti-tool input[type="range"] { width: 70px; }
 }
 `;
 
 // ---------- FrameView ----------
-// Renders a single frame: label + stage (cut/gap blocks + canvas overlay) +
-// optional dimension labels. Owns its own canvas element.
-//
-// Rendering model: strokes are not redrawn here. The parent maintains a
-// per-block offscreen bitmap with the strokes already painted, and exposes
-// it via `getBlockBitmap(blockId)`. FrameView's redraw just composites those
-// bitmaps onto the visible canvas at each block's current top. This makes
-// redraw cost O(blocks), not O(strokes) — so layout edits stay snappy even
-// with 100k+ strokes.
 const FrameView = forwardRef(function FrameView(
   {
-    frame, isSelected, showDimensions,
+    frame, isSelected, showDimensions, activeTool, selectionPhase,
     getBlockBitmap,
     onSelect,
     onPointerDown, onPointerMove, onPointerUp,
@@ -689,13 +828,14 @@ const FrameView = forwardRef(function FrameView(
   ref,
 ) {
   const canvasRef = useRef(null);
+  const overlayRef = useRef(null);
   const dprRef = useRef(1);
 
   const totalHeight = useMemo(
     () => frame.blocks.reduce((s, b) => s + b.height, 0),
     [frame.blocks],
   );
-  const cutWidth = Math.max(50, frame.canvasWidth - 2 * frame.sideMargin);
+  const cutWidth = Math.max(50, frame.canvasWidth - 2 * frame.sideMargin); // kept for left sidebar display only
 
   const blockLayout = useMemo(() => {
     let y = 0;
@@ -717,9 +857,6 @@ const FrameView = forwardRef(function FrameView(
     const dpr = dprRef.current;
     ctx.clearRect(0, 0, c.width / dpr, c.height / dpr);
 
-    // Composite each block's pre-rendered bitmap at its current top. The
-    // bitmap is taller than the block by 2*BITMAP_Y_PADDING (padding above
-    // and below) so strokes can extend past block edges naturally.
     let y = 0;
     for (const b of frame.blocks) {
       const entry = getBlockBitmap(b.id);
@@ -736,34 +873,67 @@ const FrameView = forwardRef(function FrameView(
     }
   }, [frame.blocks, getBlockBitmap]);
 
-  // Sync canvas size + redraw before paint, so stroke positions never lag
-  // behind block layout changes.
   useLayoutEffect(() => {
-    const c = canvasRef.current;
-    if (!c) return;
     const dpr = Math.min(window.devicePixelRatio || 1, DPR_CAP);
     dprRef.current = dpr;
-    c.width = Math.max(1, frame.canvasWidth * dpr);
-    c.height = Math.max(1, totalHeight * dpr);
-    c.style.width = `${frame.canvasWidth}px`;
-    c.style.height = `${totalHeight}px`;
-    const ctx = c.getContext('2d');
-    ctx.setTransform(1, 0, 0, 1, 0, 0);
-    ctx.scale(dpr, dpr);
-    ctx.lineCap = 'round';
-    ctx.lineJoin = 'round';
+
+    // Main canvas
+    const c = canvasRef.current;
+    if (c) {
+      c.width = Math.max(1, frame.canvasWidth * dpr);
+      c.height = Math.max(1, totalHeight * dpr);
+      c.style.width = `${frame.canvasWidth}px`;
+      c.style.height = `${totalHeight}px`;
+      const ctx = c.getContext('2d');
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+      ctx.scale(dpr, dpr);
+      ctx.lineCap = 'round';
+      ctx.lineJoin = 'round';
+    }
+
+    // Overlay canvas
+    const oc = overlayRef.current;
+    if (oc) {
+      oc.width = Math.max(1, frame.canvasWidth * dpr);
+      oc.height = Math.max(1, totalHeight * dpr);
+      oc.style.width = `${frame.canvasWidth}px`;
+      oc.style.height = `${totalHeight}px`;
+    }
+
     redraw();
   }, [frame.canvasWidth, totalHeight, redraw]);
 
-  useImperativeHandle(ref, () => ({ redraw }), [redraw]);
+  useImperativeHandle(ref, () => ({
+    redraw,
+    getMainCanvas: () => canvasRef.current,
+    getOverlayCanvas: () => overlayRef.current,
+    getDpr: () => dprRef.current,
+    clearOverlay: () => {
+      const oc = overlayRef.current;
+      if (!oc) return;
+      const ctx = oc.getContext('2d');
+      ctx.clearRect(0, 0, oc.width, oc.height);
+    },
+  }), [redraw]);
+
+  // Determine overlay cursor class
+  let overlayCursorClass = 'tool-pen';
+  if (activeTool === 'lasso') {
+    if (selectionPhase === 'selected' || selectionPhase === 'dragging'
+      || selectionPhase === 'resizing' || selectionPhase === 'rotating') {
+      overlayCursorClass = 'tool-lasso-selected';
+    } else {
+      overlayCursorClass = 'tool-lasso';
+    }
+  }
 
   const handleDown = (e) => {
     onSelect(frame.id);
-    onPointerDown(e, frame.id, canvasRef.current);
+    onPointerDown(e, frame.id, overlayRef.current);
   };
 
   return (
-    <div className={`conti-frame ${isSelected ? 'selected' : ''}`}>
+    <div className={`conti-frame ${isSelected ? 'selected' : ''}`} data-frame-id={frame.id}>
       <div className="conti-frame-label" onClick={() => onSelect(frame.id)}>
         {frame.name}
       </div>
@@ -771,27 +941,39 @@ const FrameView = forwardRef(function FrameView(
         className="conti-frame-stage"
         style={{ width: `${frame.canvasWidth}px`, height: `${totalHeight}px` }}
       >
-        {blockLayout.map((b) => (
-          <div
-            key={`bg-${b.id}`}
-            className={`conti-block ${b.type}`}
-            style={{
-              top: `${b.top}px`,
-              left: b.type === 'cut' ? `${frame.sideMargin}px` : '0px',
-              width: b.type === 'cut' ? `${cutWidth}px` : `${frame.canvasWidth}px`,
-              height: `${b.height}px`,
-            }}
-          />
-        ))}
+        {blockLayout.map((b) => {
+          const ml = b.type === 'cut' ? (b.marginLeft ?? frame.sideMargin) : 0;
+          const mr = b.type === 'cut' ? (b.marginRight ?? frame.sideMargin) : 0;
+          const bw = b.type === 'cut' ? Math.max(10, frame.canvasWidth - ml - mr) : frame.canvasWidth;
+          return (
+            <div
+              key={`bg-${b.id}`}
+              className={`conti-block ${b.type}`}
+              style={{
+                top: `${b.top}px`,
+                left: `${ml}px`,
+                width: `${bw}px`,
+                height: `${b.height}px`,
+              }}
+            />
+          );
+        })}
+        {/* Main drawing canvas (pointer-events none, driven by overlay) */}
         <canvas
           ref={canvasRef}
           className="conti-frame-canvas"
           style={{ touchAction: 'none' }}
+        />
+        {/* Overlay: handles all pointer events */}
+        <canvas
+          ref={overlayRef}
+          className={`conti-frame-overlay ${overlayCursorClass}`}
+          style={{ touchAction: 'none' }}
           onPointerDown={handleDown}
-          onPointerMove={(e) => onPointerMove(e, canvasRef.current)}
-          onPointerUp={(e) => onPointerUp(e, canvasRef.current)}
-          onPointerCancel={(e) => onPointerUp(e, canvasRef.current)}
-          onPointerLeave={(e) => onPointerUp(e, canvasRef.current)}
+          onPointerMove={(e) => onPointerMove(e, overlayRef.current)}
+          onPointerUp={(e) => onPointerUp(e, overlayRef.current)}
+          onPointerCancel={(e) => onPointerUp(e, overlayRef.current)}
+          onPointerLeave={(e) => onPointerUp(e, overlayRef.current)}
         />
         {showDimensions && blockLayout.map((b) => (
           <div
@@ -823,14 +1005,7 @@ export default function ContiProgram() {
   const [selectedFrameId, setSelectedFrameId] = useState(() => frames[0].id);
   const selectedFrame = frames.find((f) => f.id === selectedFrameId) || null;
 
-  // Per-frame drawing state. New schema (block-local + cached bitmaps):
-  //   strokesByFrameRef.current[frameId] = {
-  //     byBlock: { [blockId]: Stroke[] },   // points are block-local
-  //     bitmaps: { [blockId]: BitmapEntry } // pre-rendered, lazy-allocated
-  //     history: [{ blockId }]               // for undo, latest at end
-  //   }
-  // Storing strokes block-local lets resize/reorder be O(1) — only block
-  // tops change, the bitmaps composite at new positions automatically.
+  // Per-frame drawing state.
   const strokesByFrameRef = useRef({});
   const ensureFrameStore = useCallback((fid) => {
     if (!strokesByFrameRef.current[fid]) {
@@ -840,29 +1015,61 @@ export default function ContiProgram() {
   }, []);
   for (const f of frames) ensureFrameStore(f.id);
 
-  // Pen state — global across frames.
+  // Pen state
   const [penSize, setPenSize] = useState(4);
   const [penOpacity, setPenOpacity] = useState(100);
 
+  // Tool state
+  const [activeTool, setActiveTool] = useState('pen'); // 'pen' | 'lasso'
+  const [hasSelection, setHasSelection] = useState(false);
+  const [hasClipboard, setHasClipboard] = useState(false);
+  const [selectionPhase, setSelectionPhase] = useState('idle');
+
   // Drawing in-progress state.
-  const drawingRef = useRef(null); // { frameId } | null
+  const drawingRef = useRef(null);
   const currentStrokeRef = useRef(null);
+
+  // Lasso state machine
+  const lassoRef = useRef({
+    phase: 'idle', // 'idle'|'drawing'|'selected'|'dragging'|'resizing'|'rotating'
+    frameId: null,
+    lassoPoints: [],
+    selectedItems: [],  // { stroke, blockId, blockTop, framePoints }
+    bbox: null,         // { minX, minY, maxX, maxY, cx, cy }
+    transform: { tx: 0, ty: 0, scaleX: 1, scaleY: 1, angle: 0, flipH: false, flipV: false },
+    dragStart: null,
+    origTransform: null,
+    dragHandle: null,
+    origHandleDist: null,
+  });
+
+  // Clipboard (copy/paste)
+  const clipboardRef = useRef(null);
 
   // Multi-touch pan tracking.
   const canvasAreaRef = useRef(null);
-  const activeTouchPointersRef = useRef(new Map()); // pointerId -> {x, y}
-  const panStateRef = useRef(null); // {lastX, lastY} | null
+  const activeTouchPointersRef = useRef(new Map());
+  const panStateRef = useRef(null);
 
-  // Imperative handles to each FrameView so we can trigger redraws when
-  // strokes change (since strokes live in a ref, not state).
+  // Imperative handles to each FrameView
   const frameRefs = useRef({});
 
+  const selectAndScrollToFrame = useCallback((frameId) => {
+    setSelectedFrameId(frameId);
+    const area = canvasAreaRef.current;
+    if (!area) return;
+    const el = area.querySelector(`[data-frame-id="${frameId}"]`);
+    if (!el) return;
+    const areaRect = area.getBoundingClientRect();
+    const elRect = el.getBoundingClientRect();
+    area.scrollTo({
+      left: area.scrollLeft + elRect.left - areaRect.left - 80,
+      top: 0,
+      behavior: 'smooth',
+    });
+  }, []);
+
   // ---------- block bitmap management ----------
-  // Lazy-allocate / grow / clear / rebuild per-block offscreen bitmaps.
-  // All bitmap canvases are dpr-scaled and use logical (CSS-px) drawing
-  // coordinates; the y origin in those logical coords is shifted by
-  // BITMAP_Y_PADDING so strokes that extend slightly above the block top
-  // (negative local y) still fit.
   const getBitmapDpr = useCallback(
     () => Math.min(window.devicePixelRatio || 1, DPR_CAP),
     [],
@@ -885,7 +1092,6 @@ export default function ContiProgram() {
       entry = createBlockBitmap(frameWidth, targetH, dpr);
       store.bitmaps[block.id] = entry;
     } else if (widthMismatch || tooShort) {
-      // Re-allocate at new size and copy old contents over.
       const next = createBlockBitmap(
         frameWidth,
         Math.max(targetH, entry.logicalHeight),
@@ -908,22 +1114,23 @@ export default function ContiProgram() {
     entry.ctx.restore();
   }, [ensureFrameStore]);
 
-  // Fully rebuild a block's bitmap from its stroke list (used after undo,
-  // since strokes draw additively and we can't subtract one).
+  // Rebuild a block's bitmap (skips hidden strokes — used during lasso selection)
   const rebuildBlockBitmap = useCallback((frameId, block, frameWidth) => {
     const store = ensureFrameStore(frameId);
     const strokes = store.byBlock[block.id] || [];
     let maxY = 0;
     for (const s of strokes) {
+      if (s.hidden) continue;
       if (s.bbox && s.bbox.maxY > maxY) maxY = s.bbox.maxY;
     }
     const entry = ensureBlockBitmap(frameId, block, frameWidth, maxY);
     clearBlockBitmap(frameId, block.id);
-    for (const s of strokes) renderStrokeToCtx(entry.ctx, s, BITMAP_Y_PADDING);
+    for (const s of strokes) {
+      if (s.hidden) continue;
+      renderStrokeToCtx(entry.ctx, s, BITMAP_Y_PADDING);
+    }
   }, [ensureFrameStore, ensureBlockBitmap, clearBlockBitmap]);
 
-  // Stable getter for FrameView so React doesn't see a new function every
-  // render. The closure reads from the ref, which is always current.
   const getBlockBitmapRef = useRef({});
   for (const f of frames) {
     if (!getBlockBitmapRef.current[f.id]) {
@@ -941,64 +1148,528 @@ export default function ContiProgram() {
   const [dragOverPos, setDragOverPos] = useState(null);
   const blockListRef = useRef(null);
 
-  // ---------- pointer / drawing ----------
+  // Viewport-center active block tracking.
+  const [activeBlockId, setActiveBlockId] = useState(null);
+
+  // ---------- coord helper ----------
   const getCanvasPoint = (e, canvasEl, frame) => {
     const rect = canvasEl.getBoundingClientRect();
-    const totalHeight = frame.blocks.reduce((s, b) => s + b.height, 0);
+    const totalH = frame.blocks.reduce((s, b) => s + b.height, 0);
     const sx = frame.canvasWidth / rect.width;
-    const sy = totalHeight / rect.height;
+    const sy = totalH / rect.height;
     return {
       x: (e.clientX - rect.left) * sx,
       y: (e.clientY - rect.top) * sy,
     };
   };
 
-  const handlePointerDown = (e, frameId, canvasEl) => {
-    // --- Two-finger pan (touch only) ---
+  // =====================================================================
+  //  LASSO: overlay rendering
+  // =====================================================================
+  const renderSelectionOverlay = (frameId) => {
+    const fref = frameRefs.current[frameId];
+    if (!fref) return;
+    const oc = fref.getOverlayCanvas();
+    if (!oc) return;
+    const dpr = fref.getDpr();
+
+    const ctx = oc.getContext('2d');
+    ctx.clearRect(0, 0, oc.width, oc.height);
+
+    const lasso = lassoRef.current;
+    const { phase, lassoPoints, selectedItems, bbox, transform } = lasso;
+
+    ctx.save();
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+
+    // ---- Phase: drawing ----
+    if (phase === 'drawing' && lassoPoints.length > 1) {
+      ctx.strokeStyle = LASSO_COLOR;
+      ctx.lineWidth = 1.5;
+      ctx.setLineDash([5, 3]);
+      ctx.globalAlpha = 0.85;
+      ctx.beginPath();
+      ctx.moveTo(lassoPoints[0].x, lassoPoints[0].y);
+      for (let i = 1; i < lassoPoints.length; i++) {
+        ctx.lineTo(lassoPoints[i].x, lassoPoints[i].y);
+      }
+      ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.globalAlpha = 1;
+    }
+
+    // ---- Phase: selected / dragging / resizing / rotating ----
+    if (bbox && ['selected', 'dragging', 'resizing', 'rotating'].includes(phase)) {
+      const { cx, cy } = bbox;
+
+      // Draw each selected stroke with the current transform applied
+      for (const item of selectedItems) {
+        const pts = item.framePoints.map(p =>
+          applySelectionTransform(p.x, p.y, cx, cy, transform)
+        );
+        ctx.strokeStyle = `rgba(15, 15, 15, ${item.stroke.opacity})`;
+        ctx.fillStyle = `rgba(15, 15, 15, ${item.stroke.opacity})`;
+        ctx.lineWidth = item.stroke.size;
+        if (pts.length === 1) {
+          ctx.beginPath();
+          ctx.arc(pts[0].x, pts[0].y, item.stroke.size / 2, 0, Math.PI * 2);
+          ctx.fill();
+        } else {
+          ctx.beginPath();
+          ctx.moveTo(pts[0].x, pts[0].y);
+          for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i].x, pts[i].y);
+          ctx.stroke();
+        }
+      }
+
+      // Draw selection bounding box
+      const handles = getHandlePositions(bbox, transform);
+      const corners = [handles.tl, handles.tr, handles.br, handles.bl];
+
+      ctx.strokeStyle = LASSO_COLOR;
+      ctx.lineWidth = 1.5;
+      ctx.setLineDash([5, 3]);
+      ctx.globalAlpha = 0.9;
+      ctx.beginPath();
+      ctx.moveTo(corners[0].x, corners[0].y);
+      for (let i = 1; i < corners.length; i++) ctx.lineTo(corners[i].x, corners[i].y);
+      ctx.closePath();
+      ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.globalAlpha = 1;
+
+      // Line from tc to rotate handle
+      ctx.strokeStyle = LASSO_COLOR;
+      ctx.lineWidth = 1;
+      ctx.globalAlpha = 0.5;
+      ctx.beginPath();
+      ctx.moveTo(handles.tc.x, handles.tc.y);
+      ctx.lineTo(handles.rotate.x, handles.rotate.y);
+      ctx.stroke();
+      ctx.globalAlpha = 1;
+
+      // Resize handles (squares)
+      for (const hid of ['tl', 'tr', 'br', 'bl', 'tc', 'bc', 'lc', 'rc']) {
+        const h = handles[hid];
+        const hs = HANDLE_SIZE;
+        ctx.fillStyle = '#ffffff';
+        ctx.strokeStyle = LASSO_COLOR;
+        ctx.lineWidth = 1.5;
+        ctx.beginPath();
+        ctx.rect(h.x - hs / 2, h.y - hs / 2, hs, hs);
+        ctx.fill();
+        ctx.stroke();
+      }
+
+      // Rotation handle (circle)
+      const r = handles.rotate;
+      ctx.fillStyle = LASSO_COLOR;
+      ctx.strokeStyle = '#ffffff';
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      ctx.arc(r.x, r.y, HANDLE_SIZE / 2 + 2, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.stroke();
+    }
+
+    ctx.restore();
+  };
+
+  // =====================================================================
+  //  LASSO: select strokes inside polygon
+  // =====================================================================
+  const selectStrokesInLasso = (frameId) => {
+    const lasso = lassoRef.current;
+    const frame = frames.find(f => f.id === frameId);
+    if (!frame) return;
+    const store = ensureFrameStore(frameId);
+    const tops = computeBlockTops(frame.blocks);
+
+    const selectedItems = [];
+    const dirtyBlocks = new Set();
+
+    for (const block of frame.blocks) {
+      const blockTop = tops[block.id];
+      const strokes = store.byBlock[block.id] || [];
+      for (const stroke of strokes) {
+        if (stroke.hidden) continue;
+        // Use centroid of stroke bbox in frame coords for hit test
+        const centX = (stroke.bbox.minX + stroke.bbox.maxX) / 2;
+        const centY = (stroke.bbox.minY + stroke.bbox.maxY) / 2 + blockTop;
+        if (pointInPolygon(centX, centY, lasso.lassoPoints)) {
+          selectedItems.push({
+            stroke,
+            blockId: block.id,
+            blockTop,
+            framePoints: stroke.points.map(p => ({ x: p.x, y: p.y + blockTop })),
+          });
+          stroke.hidden = true;
+          dirtyBlocks.add(block.id);
+        }
+      }
+    }
+
+    if (selectedItems.length === 0) {
+      lasso.phase = 'idle';
+      frameRefs.current[frameId]?.clearOverlay();
+      setHasSelection(false);
+      setSelectionPhase('idle');
+      return;
+    }
+
+    // Compute bbox in frame coords
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    for (const item of selectedItems) {
+      for (const p of item.framePoints) {
+        if (p.x < minX) minX = p.x;
+        if (p.y < minY) minY = p.y;
+        if (p.x > maxX) maxX = p.x;
+        if (p.y > maxY) maxY = p.y;
+      }
+    }
+    // Add a little margin for stroke width
+    const maxSz = Math.max(...selectedItems.map(i => i.stroke.size / 2));
+    minX -= maxSz; minY -= maxSz;
+    maxX += maxSz; maxY += maxSz;
+
+    lasso.selectedItems = selectedItems;
+    lasso.bbox = { minX, minY, maxX, maxY, cx: (minX + maxX) / 2, cy: (minY + maxY) / 2 };
+    lasso.transform = { tx: 0, ty: 0, scaleX: 1, scaleY: 1, angle: 0, flipH: false, flipV: false };
+    lasso.phase = 'selected';
+
+    // Rebuild dirty blocks (hides selected strokes from main canvas)
+    for (const blockId of dirtyBlocks) {
+      const block = frame.blocks.find(b => b.id === blockId);
+      if (block) rebuildBlockBitmap(frameId, block, frame.canvasWidth);
+    }
+    frameRefs.current[frameId]?.redraw();
+
+    setHasSelection(true);
+    setSelectionPhase('selected');
+    renderSelectionOverlay(frameId);
+  };
+
+  // =====================================================================
+  //  LASSO: apply selection (commit transformed strokes back to blocks)
+  // =====================================================================
+  const applyLassoSelection = (frameId, frame) => {
+    const lasso = lassoRef.current;
+    if (!lasso.selectedItems || lasso.selectedItems.length === 0) {
+      cancelLassoSelection(frameId, frame);
+      return;
+    }
+
+    const store = ensureFrameStore(frameId);
+    const { bbox, transform, selectedItems } = lasso;
+    const { cx, cy } = bbox;
+    const tops = computeBlockTops(frame.blocks);
+    const dirtyBlocks = new Set();
+
+    for (const item of selectedItems) {
+      // Remove hidden original from its block
+      const origArr = store.byBlock[item.blockId];
+      if (origArr) {
+        const idx = origArr.indexOf(item.stroke);
+        if (idx >= 0) origArr.splice(idx, 1);
+        dirtyBlocks.add(item.blockId);
+      }
+
+      // Apply transform to get new frame-coord points
+      const newFramePts = item.framePoints.map(p =>
+        applySelectionTransform(p.x, p.y, cx, cy, transform)
+      );
+
+      // Find which block the transformed centroid belongs to
+      const centX = newFramePts.reduce((s, p) => s + p.x, 0) / newFramePts.length;
+      const centY = newFramePts.reduce((s, p) => s + p.y, 0) / newFramePts.length;
+      const probe = { points: [{ x: centX, y: centY }] };
+      const newBlockId = findStrokeBlockId(probe, frame.blocks, tops);
+      if (newBlockId == null) continue;
+
+      const newBlockTop = tops[newBlockId];
+      const newLocalPts = newFramePts.map(p => ({ x: p.x, y: p.y - newBlockTop }));
+      const newStroke = {
+        points: newLocalPts,
+        size: item.stroke.size,
+        opacity: item.stroke.opacity,
+        bbox: computeBbox(newLocalPts),
+        hidden: false,
+      };
+
+      if (!store.byBlock[newBlockId]) store.byBlock[newBlockId] = [];
+      store.byBlock[newBlockId].push(newStroke);
+      store.history.push({ blockId: newBlockId });
+      dirtyBlocks.add(newBlockId);
+    }
+
+    // Rebuild all dirty bitmaps
+    for (const blockId of dirtyBlocks) {
+      const block = frame.blocks.find(b => b.id === blockId);
+      if (block) rebuildBlockBitmap(frameId, block, frame.canvasWidth);
+    }
+    frameRefs.current[frameId]?.redraw();
+
+    // Reset
+    lasso.phase = 'idle';
+    lasso.selectedItems = [];
+    lasso.bbox = null;
+    lasso.frameId = null;
+    frameRefs.current[frameId]?.clearOverlay();
+    setHasSelection(false);
+    setSelectionPhase('idle');
+  };
+
+  // =====================================================================
+  //  LASSO: cancel selection (restore strokes, no transform applied)
+  // =====================================================================
+  const cancelLassoSelection = (frameId, frame) => {
+    const lasso = lassoRef.current;
+    const store = ensureFrameStore(frameId);
+    const dirtyBlocks = new Set();
+
+    for (const item of lasso.selectedItems || []) {
+      item.stroke.hidden = false;
+      dirtyBlocks.add(item.blockId);
+    }
+
+    const fr = frame || frames.find(f => f.id === frameId);
+    for (const blockId of dirtyBlocks) {
+      const block = fr?.blocks.find(b => b.id === blockId);
+      if (block) rebuildBlockBitmap(frameId, block, fr.canvasWidth);
+    }
+    frameRefs.current[frameId]?.redraw();
+
+    lasso.phase = 'idle';
+    lasso.selectedItems = [];
+    lasso.bbox = null;
+    lasso.frameId = null;
+    frameRefs.current[frameId]?.clearOverlay();
+    setHasSelection(false);
+    setSelectionPhase('idle');
+  };
+
+  // =====================================================================
+  //  LASSO: copy
+  // =====================================================================
+  const copySelection = () => {
+    const lasso = lassoRef.current;
+    if (!lasso.selectedItems || lasso.selectedItems.length === 0) return;
+    const { bbox, transform, selectedItems } = lasso;
+    const { cx, cy } = bbox;
+
+    clipboardRef.current = selectedItems.map(item => ({
+      size: item.stroke.size,
+      opacity: item.stroke.opacity,
+      framePoints: item.framePoints.map(p =>
+        applySelectionTransform(p.x, p.y, cx, cy, transform)
+      ),
+    }));
+    setHasClipboard(true);
+  };
+
+  // =====================================================================
+  //  LASSO: paste
+  // =====================================================================
+  const pasteSelection = () => {
+    const cb = clipboardRef.current;
+    if (!cb || cb.length === 0 || !selectedFrame) return;
+
+    const OFFSET = 24;
+    const store = ensureFrameStore(selectedFrameId);
+    const tops = computeBlockTops(selectedFrame.blocks);
+    const dirtyBlocks = new Set();
+
+    for (const item of cb) {
+      const offsetPts = item.framePoints.map(p => ({ x: p.x + OFFSET, y: p.y + OFFSET }));
+      const centX = offsetPts.reduce((s, p) => s + p.x, 0) / offsetPts.length;
+      const centY = offsetPts.reduce((s, p) => s + p.y, 0) / offsetPts.length;
+      const probe = { points: [{ x: centX, y: centY }] };
+      const blockId = findStrokeBlockId(probe, selectedFrame.blocks, tops);
+      if (blockId == null) continue;
+
+      const blockTop = tops[blockId];
+      const localPts = offsetPts.map(p => ({ x: p.x, y: p.y - blockTop }));
+      const newStroke = {
+        points: localPts,
+        size: item.size,
+        opacity: item.opacity,
+        bbox: computeBbox(localPts),
+        hidden: false,
+      };
+      if (!store.byBlock[blockId]) store.byBlock[blockId] = [];
+      store.byBlock[blockId].push(newStroke);
+      store.history.push({ blockId });
+      dirtyBlocks.add(blockId);
+    }
+
+    for (const blockId of dirtyBlocks) {
+      const block = selectedFrame.blocks.find(b => b.id === blockId);
+      if (block) rebuildBlockBitmap(selectedFrameId, block, selectedFrame.canvasWidth);
+    }
+    frameRefs.current[selectedFrameId]?.redraw();
+  };
+
+  // =====================================================================
+  //  LASSO: flip H/V
+  // =====================================================================
+  const flipSelection = (axis) => {
+    const lasso = lassoRef.current;
+    if (!['selected', 'dragging', 'resizing', 'rotating'].includes(lasso.phase)) return;
+    if (axis === 'h') {
+      lasso.transform = { ...lasso.transform, flipH: !lasso.transform.flipH };
+    } else {
+      lasso.transform = { ...lasso.transform, flipV: !lasso.transform.flipV };
+    }
+    renderSelectionOverlay(lasso.frameId);
+  };
+
+  // =====================================================================
+  //  LASSO: rotate by degrees
+  // =====================================================================
+  const rotateSelectionDeg = (deg) => {
+    const lasso = lassoRef.current;
+    if (!['selected', 'dragging', 'resizing', 'rotating'].includes(lasso.phase)) return;
+    lasso.transform = {
+      ...lasso.transform,
+      angle: lasso.transform.angle + deg * Math.PI / 180,
+    };
+    renderSelectionOverlay(lasso.frameId);
+  };
+
+  // =====================================================================
+  //  LASSO: delete selection
+  // =====================================================================
+  const deleteSelection = () => {
+    const lasso = lassoRef.current;
+    if (!lasso.selectedItems || lasso.selectedItems.length === 0) return;
+    const frameId = lasso.frameId;
+    const frame = frames.find(f => f.id === frameId);
+    const store = ensureFrameStore(frameId);
+    const dirtyBlocks = new Set();
+
+    for (const item of lasso.selectedItems) {
+      const arr = store.byBlock[item.blockId];
+      if (arr) {
+        const idx = arr.indexOf(item.stroke);
+        if (idx >= 0) arr.splice(idx, 1);
+        dirtyBlocks.add(item.blockId);
+      }
+    }
+
+    for (const blockId of dirtyBlocks) {
+      const block = frame?.blocks.find(b => b.id === blockId);
+      if (block) rebuildBlockBitmap(frameId, block, frame.canvasWidth);
+    }
+    frameRefs.current[frameId]?.redraw();
+
+    lasso.phase = 'idle';
+    lasso.selectedItems = [];
+    lasso.bbox = null;
+    lasso.frameId = null;
+    frameRefs.current[frameId]?.clearOverlay();
+    setHasSelection(false);
+    setSelectionPhase('idle');
+  };
+
+  // =====================================================================
+  //  LASSO: pointer handlers
+  // =====================================================================
+  const handleLassoPointerDown = (e, frameId, overlayEl) => {
+    // Two-finger touch → pan (same as pen mode)
     if (e.pointerType === 'touch') {
       activeTouchPointersRef.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
       if (activeTouchPointersRef.current.size >= 2) {
-        // Cancel any stroke in progress when the 2nd finger lands
-        if (drawingRef.current) {
-          const cancelledFrameId = drawingRef.current.frameId;
-          drawingRef.current = null;
-          currentStrokeRef.current = null;
-          // Redraw to clear the in-progress stroke visuals
-          frameRefs.current[cancelledFrameId]?.redraw();
+        const lasso = lassoRef.current;
+        if (lasso.phase === 'drawing') {
+          lasso.phase = 'idle';
+          frameRefs.current[frameId]?.clearOverlay();
+          setSelectionPhase('idle');
         }
-        // Start pan tracking
         if (!panStateRef.current) {
           const pts = [...activeTouchPointersRef.current.values()];
           const avgX = pts.reduce((s, p) => s + p.x, 0) / pts.length;
           const avgY = pts.reduce((s, p) => s + p.y, 0) / pts.length;
           panStateRef.current = { lastX: avgX, lastY: avgY };
         }
-        try { canvasEl?.releasePointerCapture(e.pointerId); } catch (_) {}
+        try { overlayEl?.releasePointerCapture(e.pointerId); } catch (_) {}
         return;
       }
     }
 
-    // --- Single touch or pen: draw ---
     e.preventDefault();
-    const frame = frames.find((f) => f.id === frameId);
-    if (!frame || !canvasEl) return;
-    try { canvasEl.setPointerCapture(e.pointerId); } catch (_) {}
-    const p = getCanvasPoint(e, canvasEl, frame);
-    drawingRef.current = { frameId };
-    currentStrokeRef.current = {
-      points: [p],
-      size: penSize,
-      opacity: penOpacity / 100,
-    };
-    const ctx = canvasEl.getContext('2d');
-    ctx.fillStyle = `rgba(15, 15, 15, ${penOpacity / 100})`;
-    ctx.beginPath();
-    ctx.arc(p.x, p.y, penSize / 2, 0, Math.PI * 2);
-    ctx.fill();
+    const frame = frames.find(f => f.id === frameId);
+    if (!frame || !overlayEl) return;
+    const p = getCanvasPoint(e, overlayEl, frame);
+    const lasso = lassoRef.current;
+
+    // If there's a selection in ANOTHER frame, apply it first
+    if (lasso.frameId && lasso.frameId !== frameId &&
+        ['selected', 'dragging', 'resizing', 'rotating'].includes(lasso.phase)) {
+      const prevFrame = frames.find(f => f.id === lasso.frameId);
+      if (prevFrame) applyLassoSelection(lasso.frameId, prevFrame);
+    }
+
+    // If already selected in this frame, check handle/move/deselect
+    if (lasso.frameId === frameId &&
+        ['selected', 'dragging', 'resizing', 'rotating'].includes(lasso.phase)) {
+      const handles = getHandlePositions(lasso.bbox, lasso.transform);
+      const hitHandle = hitTestHandles(p.x, p.y, handles);
+
+      if (hitHandle === 'rotate') {
+        lasso.phase = 'rotating';
+        lasso.dragStart = p;
+        lasso.origTransform = { ...lasso.transform };
+        setSelectionPhase('rotating');
+        try { overlayEl.setPointerCapture(e.pointerId); } catch (_) {}
+        return;
+      }
+
+      if (hitHandle) {
+        lasso.phase = 'resizing';
+        lasso.dragHandle = hitHandle;
+        lasso.dragStart = p;
+        lasso.origTransform = { ...lasso.transform };
+        // Compute handle-to-(transformed)center distance for scale reference
+        const { cx, cy } = lasso.bbox;
+        const cxT = cx + lasso.transform.tx;
+        const cyT = cy + lasso.transform.ty;
+        lasso.origHandleDist = { x: handles[hitHandle].x - cxT, y: handles[hitHandle].y - cyT };
+        setSelectionPhase('resizing');
+        try { overlayEl.setPointerCapture(e.pointerId); } catch (_) {}
+        return;
+      }
+
+      // Check if inside bbox quad
+      const inside = pointInPolygon(p.x, p.y, [handles.tl, handles.tr, handles.br, handles.bl]);
+      if (inside) {
+        lasso.phase = 'dragging';
+        lasso.dragStart = p;
+        lasso.origTransform = { ...lasso.transform };
+        setSelectionPhase('dragging');
+        try { overlayEl.setPointerCapture(e.pointerId); } catch (_) {}
+        return;
+      }
+
+      // Clicked outside → apply selection, fall through to start new lasso
+      applyLassoSelection(frameId, frame);
+    }
+
+    // Start new lasso
+    lasso.phase = 'drawing';
+    lasso.frameId = frameId;
+    lasso.lassoPoints = [p];
+    lasso.selectedItems = [];
+    lasso.bbox = null;
+    lasso.transform = { tx: 0, ty: 0, scaleX: 1, scaleY: 1, angle: 0, flipH: false, flipV: false };
+    setSelectionPhase('drawing');
+    try { overlayEl.setPointerCapture(e.pointerId); } catch (_) {}
+    renderSelectionOverlay(frameId);
   };
 
-  const handlePointerMove = (e, canvasEl) => {
-    // --- Two-finger pan ---
+  const handleLassoPointerMove = (e, overlayEl) => {
+    // Two-finger pan
     if (e.pointerType === 'touch') {
       if (activeTouchPointersRef.current.has(e.pointerId)) {
         activeTouchPointersRef.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
@@ -1018,42 +1689,274 @@ export default function ContiProgram() {
       }
     }
 
-    // --- Drawing ---
-    if (!drawingRef.current || !canvasEl) return;
+    const lasso = lassoRef.current;
+    if (lasso.phase === 'idle') return;
+    if (!overlayEl) return;
+    e.preventDefault();
+
+    const frame = frames.find(f => f.id === lasso.frameId);
+    if (!frame) return;
+    const p = getCanvasPoint(e, overlayEl, frame);
+
+    if (lasso.phase === 'drawing') {
+      lasso.lassoPoints.push(p);
+      renderSelectionOverlay(lasso.frameId);
+      return;
+    }
+
+    if (lasso.phase === 'dragging') {
+      const dx = p.x - lasso.dragStart.x;
+      const dy = p.y - lasso.dragStart.y;
+      lasso.transform = {
+        ...lasso.origTransform,
+        tx: lasso.origTransform.tx + dx,
+        ty: lasso.origTransform.ty + dy,
+      };
+      renderSelectionOverlay(lasso.frameId);
+      return;
+    }
+
+    if (lasso.phase === 'resizing') {
+      const { cx, cy } = lasso.bbox;
+      const cxT = cx + lasso.origTransform.tx;
+      const cyT = cy + lasso.origTransform.ty;
+      const hid = lasso.dragHandle;
+      const { origHandleDist } = lasso;
+
+      // Current pointer vector from transformed center
+      const dx = p.x - cxT;
+      const dy = p.y - cyT;
+
+      let newScaleX = lasso.origTransform.scaleX;
+      let newScaleY = lasso.origTransform.scaleY;
+
+      if (['tl', 'tr', 'bl', 'br'].includes(hid)) {
+        if (Math.abs(origHandleDist.x) > 1) {
+          newScaleX = Math.max(0.05, Math.abs(dx) / Math.abs(origHandleDist.x))
+            * Math.sign(lasso.origTransform.scaleX);
+        }
+        if (Math.abs(origHandleDist.y) > 1) {
+          newScaleY = Math.max(0.05, Math.abs(dy) / Math.abs(origHandleDist.y))
+            * Math.sign(lasso.origTransform.scaleY);
+        }
+      } else if (['tc', 'bc'].includes(hid)) {
+        if (Math.abs(origHandleDist.y) > 1) {
+          newScaleY = Math.max(0.05, Math.abs(dy) / Math.abs(origHandleDist.y))
+            * Math.sign(lasso.origTransform.scaleY);
+        }
+      } else if (['lc', 'rc'].includes(hid)) {
+        if (Math.abs(origHandleDist.x) > 1) {
+          newScaleX = Math.max(0.05, Math.abs(dx) / Math.abs(origHandleDist.x))
+            * Math.sign(lasso.origTransform.scaleX);
+        }
+      }
+
+      lasso.transform = { ...lasso.origTransform, scaleX: newScaleX, scaleY: newScaleY };
+      renderSelectionOverlay(lasso.frameId);
+      return;
+    }
+
+    if (lasso.phase === 'rotating') {
+      const { cx, cy } = lasso.bbox;
+      const cxT = cx + lasso.origTransform.tx;
+      const cyT = cy + lasso.origTransform.ty;
+      const startAngle = Math.atan2(lasso.dragStart.y - cyT, lasso.dragStart.x - cxT);
+      const curAngle = Math.atan2(p.y - cyT, p.x - cxT);
+      lasso.transform = {
+        ...lasso.origTransform,
+        angle: lasso.origTransform.angle + (curAngle - startAngle),
+      };
+      renderSelectionOverlay(lasso.frameId);
+      return;
+    }
+  };
+
+  const handleLassoPointerUp = (e, overlayEl) => {
+    if (e.pointerType === 'touch') {
+      activeTouchPointersRef.current.delete(e.pointerId);
+      if (activeTouchPointersRef.current.size < 2) panStateRef.current = null;
+    }
+
+    const lasso = lassoRef.current;
+
+    if (lasso.phase === 'drawing') {
+      try { overlayEl?.releasePointerCapture(e.pointerId); } catch (_) {}
+      if (lasso.lassoPoints.length >= 3) {
+        selectStrokesInLasso(lasso.frameId);
+      } else {
+        lasso.phase = 'idle';
+        frameRefs.current[lasso.frameId]?.clearOverlay();
+        setSelectionPhase('idle');
+      }
+      return;
+    }
+
+    if (['dragging', 'resizing', 'rotating'].includes(lasso.phase)) {
+      try { overlayEl?.releasePointerCapture(e.pointerId); } catch (_) {}
+      lasso.phase = 'selected';
+      setSelectionPhase('selected');
+      renderSelectionOverlay(lasso.frameId);
+      return;
+    }
+  };
+
+  // =====================================================================
+  //  Tool switch
+  // =====================================================================
+  const switchTool = (tool) => {
+    if (tool === activeTool) return;
+    // Apply any active selection before switching
+    if (activeTool === 'lasso') {
+      const lasso = lassoRef.current;
+      if (lasso.phase !== 'idle' && lasso.frameId) {
+        const fr = frames.find(f => f.id === lasso.frameId);
+        if (['selected', 'dragging', 'resizing', 'rotating'].includes(lasso.phase)) {
+          if (fr) applyLassoSelection(lasso.frameId, fr);
+        } else {
+          cancelLassoSelection(lasso.frameId, fr);
+        }
+      }
+    }
+    setActiveTool(tool);
+  };
+
+  // =====================================================================
+  //  Keyboard shortcuts
+  // =====================================================================
+  useEffect(() => {
+    const onKey = (e) => {
+      const lasso = lassoRef.current;
+      if (e.key === 'Escape' && lasso.phase !== 'idle' && lasso.frameId) {
+        const fr = frames.find(f => f.id === lasso.frameId);
+        if (['selected', 'dragging', 'resizing', 'rotating'].includes(lasso.phase)) {
+          applyLassoSelection(lasso.frameId, fr);
+        } else {
+          cancelLassoSelection(lasso.frameId, fr);
+        }
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  });
+
+  // ---------- pointer / drawing (pen) ----------
+  const handlePointerDown = (e, frameId, overlayEl) => {
+    if (activeTool === 'lasso') {
+      handleLassoPointerDown(e, frameId, overlayEl);
+      return;
+    }
+
+    // Two-finger pan
+    if (e.pointerType === 'touch') {
+      activeTouchPointersRef.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
+      if (activeTouchPointersRef.current.size >= 2) {
+        if (drawingRef.current) {
+          const cancelledFrameId = drawingRef.current.frameId;
+          drawingRef.current = null;
+          currentStrokeRef.current = null;
+          frameRefs.current[cancelledFrameId]?.redraw();
+        }
+        if (!panStateRef.current) {
+          const pts = [...activeTouchPointersRef.current.values()];
+          const avgX = pts.reduce((s, p) => s + p.x, 0) / pts.length;
+          const avgY = pts.reduce((s, p) => s + p.y, 0) / pts.length;
+          panStateRef.current = { lastX: avgX, lastY: avgY };
+        }
+        try { overlayEl?.releasePointerCapture(e.pointerId); } catch (_) {}
+        return;
+      }
+    }
+
+    e.preventDefault();
+    const frame = frames.find((f) => f.id === frameId);
+    if (!frame || !overlayEl) return;
+    try { overlayEl.setPointerCapture(e.pointerId); } catch (_) {}
+
+    const p = getCanvasPoint(e, overlayEl, frame);
+    drawingRef.current = { frameId };
+    currentStrokeRef.current = {
+      points: [p],
+      size: penSize,
+      opacity: penOpacity / 100,
+    };
+
+    // Draw on main canvas
+    const mainCanvas = frameRefs.current[frameId]?.getMainCanvas();
+    if (mainCanvas) {
+      const ctx = mainCanvas.getContext('2d');
+      ctx.fillStyle = `rgba(15, 15, 15, ${penOpacity / 100})`;
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, penSize / 2, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  };
+
+  const handlePointerMove = (e, overlayEl) => {
+    if (activeTool === 'lasso') {
+      handleLassoPointerMove(e, overlayEl);
+      return;
+    }
+
+    // Two-finger pan
+    if (e.pointerType === 'touch') {
+      if (activeTouchPointersRef.current.has(e.pointerId)) {
+        activeTouchPointersRef.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
+      }
+      if (activeTouchPointersRef.current.size >= 2) {
+        if (panStateRef.current && canvasAreaRef.current) {
+          const pts = [...activeTouchPointersRef.current.values()];
+          const avgX = pts.reduce((s, p) => s + p.x, 0) / pts.length;
+          const avgY = pts.reduce((s, p) => s + p.y, 0) / pts.length;
+          const dx = avgX - panStateRef.current.lastX;
+          const dy = avgY - panStateRef.current.lastY;
+          canvasAreaRef.current.scrollLeft -= dx;
+          canvasAreaRef.current.scrollTop -= dy;
+          panStateRef.current = { lastX: avgX, lastY: avgY };
+        }
+        return;
+      }
+    }
+
+    if (!drawingRef.current || !overlayEl) return;
     e.preventDefault();
     const frame = frames.find((f) => f.id === drawingRef.current.frameId);
     if (!frame) return;
-    const p = getCanvasPoint(e, canvasEl, frame);
+    const p = getCanvasPoint(e, overlayEl, frame);
     const s = currentStrokeRef.current;
     const last = s.points[s.points.length - 1];
     s.points.push(p);
-    const ctx = canvasEl.getContext('2d');
-    ctx.strokeStyle = `rgba(15, 15, 15, ${s.opacity})`;
-    ctx.lineWidth = s.size;
-    ctx.lineCap = 'round';
-    ctx.lineJoin = 'round';
-    ctx.beginPath();
-    ctx.moveTo(last.x, last.y);
-    ctx.lineTo(p.x, p.y);
-    ctx.stroke();
+
+    const mainCanvas = frameRefs.current[drawingRef.current.frameId]?.getMainCanvas();
+    if (mainCanvas) {
+      const ctx = mainCanvas.getContext('2d');
+      ctx.strokeStyle = `rgba(15, 15, 15, ${s.opacity})`;
+      ctx.lineWidth = s.size;
+      ctx.lineCap = 'round';
+      ctx.lineJoin = 'round';
+      ctx.beginPath();
+      ctx.moveTo(last.x, last.y);
+      ctx.lineTo(p.x, p.y);
+      ctx.stroke();
+    }
   };
 
-  const handlePointerUp = (e, canvasEl) => {
-    // --- Touch pointer cleanup ---
+  const handlePointerUp = (e, overlayEl) => {
+    if (activeTool === 'lasso') {
+      handleLassoPointerUp(e, overlayEl);
+      return;
+    }
+
     if (e.pointerType === 'touch') {
       activeTouchPointersRef.current.delete(e.pointerId);
-      if (activeTouchPointersRef.current.size < 2) {
-        panStateRef.current = null;
-      }
-      // If we were in pan mode (not drawing), exit early
+      if (activeTouchPointersRef.current.size < 2) panStateRef.current = null;
       if (!drawingRef.current) return;
     }
 
     if (!drawingRef.current) return;
     const drawState = drawingRef.current;
     drawingRef.current = null;
-    if (canvasEl) {
-      try { canvasEl.releasePointerCapture(e.pointerId); } catch (_) {}
+    if (overlayEl) {
+      try { overlayEl.releasePointerCapture(e.pointerId); } catch (_) {}
     }
     const liveStroke = currentStrokeRef.current;
     currentStrokeRef.current = null;
@@ -1062,8 +1965,6 @@ export default function ContiProgram() {
     const frame = frames.find((f) => f.id === drawState.frameId);
     if (!frame) return;
 
-    // Find owner block using the same association rule as before. Strokes
-    // are stored block-local so resize/reorder doesn't have to touch them.
     const oldTops = computeBlockTops(frame.blocks);
     const ownerId = findStrokeBlockId(liveStroke, frame.blocks, oldTops);
     if (ownerId == null) return;
@@ -1071,9 +1972,6 @@ export default function ContiProgram() {
     if (!ownerBlock) return;
     const ownerTop = oldTops[ownerId];
 
-    // Convert points to block-local coords + simplify (RDP). Simplification
-    // typically removes 60–80% of pointer samples without visible change,
-    // dramatically reducing memory and undo-rebuild cost at scale.
     const localPoints = liveStroke.points.map((p) => ({ x: p.x, y: p.y - ownerTop }));
     const simplified = rdpSimplify(localPoints, RDP_EPSILON);
     const stored = {
@@ -1081,6 +1979,7 @@ export default function ContiProgram() {
       size: liveStroke.size,
       opacity: liveStroke.opacity,
       bbox: computeBbox(simplified),
+      hidden: false,
     };
 
     const store = ensureFrameStore(drawState.frameId);
@@ -1088,9 +1987,6 @@ export default function ContiProgram() {
     store.byBlock[ownerId].push(stored);
     store.history.push({ blockId: ownerId });
 
-    // Append to the block's offscreen bitmap. The live stroke is already
-    // visible on the main canvas (drawn incrementally during the drag), so
-    // the user sees no change here — this just makes the next redraw cheap.
     const entry = ensureBlockBitmap(
       drawState.frameId,
       ownerBlock,
@@ -1122,6 +2018,10 @@ export default function ContiProgram() {
 
   const removeFrame = (id) => {
     if (frames.length <= 1) return;
+    const lasso = lassoRef.current;
+    if (lasso.frameId === id && lasso.phase !== 'idle') {
+      cancelLassoSelection(id, frames.find(f => f.id === id));
+    }
     const target = frames.find((f) => f.id === id);
     const strokeCount = countStrokesInFrame(id);
     const msg = strokeCount > 0
@@ -1148,10 +2048,6 @@ export default function ContiProgram() {
   };
 
   const updateFrameDim = (id, key, value) => {
-    // If canvasWidth changes, every block bitmap for that frame becomes the
-    // wrong width. Rebuild them at the new width before committing the
-    // state change so the next composite draws cleanly. (sideMargin is
-    // visual-only — bitmaps are full canvas width.)
     if (key === 'canvasWidth') {
       const frame = frames.find((f) => f.id === id);
       if (frame && frame.canvasWidth !== value) {
@@ -1166,9 +2062,10 @@ export default function ContiProgram() {
   // ---------- block actions (selected frame) ----------
   const addCut = (height) => {
     if (!selectedFrame) return;
+    const sm = selectedFrame.sideMargin;
     setFrames((arr) => arr.map((f) =>
       f.id === selectedFrameId
-        ? { ...f, blocks: [...f.blocks, { id: newId(), type: 'cut', height }] }
+        ? { ...f, blocks: [...f.blocks, { id: newId(), type: 'cut', height, marginLeft: sm, marginRight: sm }] }
         : f
     ));
   };
@@ -1192,16 +2089,10 @@ export default function ContiProgram() {
 
     const newBlocks = selectedFrame.blocks.filter((b) => b.id !== blockId);
 
-    // Reassign orphaned strokes to the closest remaining block, replicating
-    // the old behavior (where strokes kept their absolute frame y after a
-    // block was removed, and got re-associated by proximity on next layout
-    // change). We do it eagerly here so bitmaps stay consistent.
     if (removedBlock && removedStrokes.length > 0 && newBlocks.length > 0) {
       const newTops = computeBlockTops(newBlocks);
       const dirty = new Set();
       for (const s of removedStrokes) {
-        // Project stroke back into frame coords (using the just-removed
-        // block's old top), then find which surviving block claims it.
         const frameCoordPoints = s.points.map((p) => ({ x: p.x, y: p.y + removedTop }));
         const probe = { ...s, points: frameCoordPoints };
         const newOwner = findStrokeBlockId(probe, newBlocks, newTops);
@@ -1213,12 +2104,12 @@ export default function ContiProgram() {
           size: s.size,
           opacity: s.opacity,
           bbox: computeBbox(reLocal),
+          hidden: false,
         };
         if (!store.byBlock[newOwner]) store.byBlock[newOwner] = [];
         store.byBlock[newOwner].push(reStored);
         dirty.add(newOwner);
       }
-      // Rebuild the bitmaps of any blocks that received strokes.
       for (const bid of dirty) {
         const blk = newBlocks.find((b) => b.id === bid);
         if (blk) rebuildBlockBitmap(selectedFrameId, blk, selectedFrame.canvasWidth);
@@ -1227,7 +2118,6 @@ export default function ContiProgram() {
 
     delete store.byBlock[blockId];
     delete store.bitmaps[blockId];
-    // History entries for the removed block are now meaningless — drop them.
     store.history = store.history.filter((h) => h.blockId !== blockId);
 
     setFrames((arr) => arr.map((f) =>
@@ -1240,10 +2130,6 @@ export default function ContiProgram() {
     const h = Math.max(50, Math.min(5000, parseInt(value, 10) || 200));
     const target = selectedFrame.blocks.find((b) => b.id === blockId);
     if (!target || target.height === h) return;
-
-    // No stroke coordinates to rewrite — strokes are stored block-local, and
-    // a height change just shifts subsequent block tops. The canvas will be
-    // re-composited on the next render with bitmaps at their new positions.
     setFrames((arr) => arr.map((f) =>
       f.id === selectedFrameId
         ? { ...f, blocks: f.blocks.map((b) => (b.id === blockId ? { ...b, height: h } : b)) }
@@ -1251,7 +2137,63 @@ export default function ContiProgram() {
     ));
   };
 
-  // ---------- block drag-reorder ----------
+  const updateBlockMargin = (blockId, side, value) => {
+    if (!selectedFrame) return;
+    const v = Math.max(0, Math.min(500, parseInt(value, 10)));
+    if (!Number.isFinite(v)) return;
+    setFrames((arr) => arr.map((f) =>
+      f.id === selectedFrameId
+        ? { ...f, blocks: f.blocks.map((b) => (b.id === blockId ? { ...b, [side]: v } : b)) }
+        : f
+    ));
+  };
+
+
+  // ---------- viewport-center block tracking ----------
+  useEffect(() => {
+    const area = canvasAreaRef.current;
+    if (!area) return;
+
+    const computeActive = () => {
+      if (!selectedFrame) { setActiveBlockId(null); return; }
+      const areaRect = area.getBoundingClientRect();
+      const centerY = areaRect.top + areaRect.height / 2;
+      const rangeHalf = 200;
+      const rangeTop = centerY - rangeHalf;
+      const rangeBottom = centerY + rangeHalf;
+
+      const frameEl = area.querySelector(`[data-frame-id="${selectedFrameId}"]`);
+      if (!frameEl) { setActiveBlockId(null); return; }
+      const stageEl = frameEl.querySelector('.conti-frame-stage');
+      if (!stageEl) { setActiveBlockId(null); return; }
+      const stageRect = stageEl.getBoundingClientRect();
+
+      let y = 0;
+      let bestId = null;
+      let bestOverlap = -1;
+      for (const b of selectedFrame.blocks) {
+        const blockTop = stageRect.top + y;
+        const blockBottom = blockTop + b.height;
+        const overlap = Math.max(0, Math.min(blockBottom, rangeBottom) - Math.max(blockTop, rangeTop));
+        if (overlap > bestOverlap) {
+          bestOverlap = overlap;
+          bestId = b.id;
+        }
+        y += b.height;
+      }
+      setActiveBlockId(bestId);
+    };
+
+    area.addEventListener('scroll', computeActive, { passive: true });
+    window.addEventListener('resize', computeActive);
+    computeActive();
+    return () => {
+      area.removeEventListener('scroll', computeActive);
+      window.removeEventListener('resize', computeActive);
+    };
+  }, [selectedFrameId, selectedFrame]);
+
+
   const findRowAt = (clientY) => {
     const list = blockListRef.current;
     if (!list) return { id: null, pos: null };
@@ -1314,9 +2256,6 @@ export default function ContiProgram() {
         const sameOrder = next.length === selectedFrame.blocks.length
           && next.every((b, i) => b.id === selectedFrame.blocks[i].id);
         if (!sameOrder) {
-          // Reorder is essentially free — strokes are block-local, so we
-          // just commit the new order and the next composite picks up the
-          // bitmaps at their new tops.
           setFrames((arr) => arr.map((f) =>
             f.id === selectedFrameId ? { ...f, blocks: next } : f
           ));
@@ -1328,16 +2267,16 @@ export default function ContiProgram() {
     setDragOverPos(null);
   };
 
-  // ---------- undo / clear (selected frame only) ----------
+  // ---------- undo / clear ----------
   const undo = () => {
     if (!selectedFrame) return;
+    // Don't undo while lasso selection is active
+    if (lassoRef.current.phase !== 'idle') return;
     const store = ensureFrameStore(selectedFrameId);
     if (store.history.length === 0) return;
     const last = store.history.pop();
     const list = store.byBlock[last.blockId];
     if (list && list.length > 0) list.pop();
-    // Strokes are additive on the bitmap, so we have to rebuild from the
-    // remaining strokes in just this one block (cost O(strokes-in-block)).
     const block = selectedFrame.blocks.find((b) => b.id === last.blockId);
     if (block) rebuildBlockBitmap(selectedFrameId, block, selectedFrame.canvasWidth);
     frameRefs.current[selectedFrameId]?.redraw();
@@ -1345,6 +2284,10 @@ export default function ContiProgram() {
 
   const clearAll = () => {
     if (!selectedFrame) return;
+    // Cancel any active lasso first
+    if (lassoRef.current.phase !== 'idle' && lassoRef.current.frameId === selectedFrameId) {
+      cancelLassoSelection(selectedFrameId, selectedFrame);
+    }
     if (!window.confirm(`"${selectedFrame.name}"의 모든 드로잉을 지웁니다. 계속하시겠습니까?`)) return;
     const store = ensureFrameStore(selectedFrameId);
     store.byBlock = {};
@@ -1383,64 +2326,185 @@ export default function ContiProgram() {
           <div className="conti-brand-mark" />
           <div>
             <div className="conti-brand-name">콘티 프로그램</div>
-            <div className="conti-brand-version">conti.v0.5</div>
+            <div className="conti-brand-version">conti.v0.6</div>
           </div>
         </div>
 
-        <div className="conti-tools">
-          <div className="conti-tool">
-            <span className="conti-tool-label">size</span>
-            <input
-              type="range" min="0" max="100" step="0.5"
-              value={sizeToSlider(penSize)}
-              onChange={(e) => setPenSize(Math.round(sliderToSize(parseFloat(e.target.value)) * 10) / 10)}
-            />
-            <input
-              className="conti-num" type="number"
-              min={PEN_MIN} max={PEN_MAX} step="0.1"
-              value={penSize}
-              onChange={(e) => {
-                const v = parseFloat(e.target.value);
-                if (Number.isFinite(v)) setPenSize(Math.max(PEN_MIN, Math.min(PEN_MAX, v)));
-              }}
-            />
-            <span className="conti-tool-unit">px</span>
-          </div>
-
-          <div className="conti-tool">
-            <span className="conti-tool-label">opacity</span>
-            <input
-              type="range" min="0" max="100" step="1"
-              value={penOpacity}
-              onChange={(e) => setPenOpacity(parseInt(e.target.value, 10))}
-            />
-            <input
-              className="conti-num" type="number"
-              min="0" max="100" step="1"
-              value={penOpacity}
-              onChange={(e) => {
-                const v = parseInt(e.target.value, 10);
-                if (Number.isFinite(v)) setPenOpacity(Math.max(0, Math.min(100, v)));
-              }}
-            />
-            <span className="conti-tool-unit">%</span>
-          </div>
-
-          <div className="conti-pen-preview" title="현재 펜">
-            <div
-              className="conti-pen-dot"
-              style={{
-                width: `${previewSize}px`,
-                height: `${previewSize}px`,
-                opacity: penOpacity / 100,
-              }}
-            />
-          </div>
+        {/* Tool selector */}
+        <div className="conti-tool">
+          <button
+            className={`conti-icon-btn ${activeTool === 'pen' ? 'active' : ''}`}
+            onClick={() => switchTool('pen')}
+            title="펜 (P)"
+          >
+            ✏ pen
+          </button>
+          <button
+            className={`conti-icon-btn ${activeTool === 'lasso' ? 'active' : ''}`}
+            onClick={() => switchTool('lasso')}
+            title="올가미 (L)"
+          >
+            ⬡ lasso
+          </button>
         </div>
+
+        <div className="conti-tool-sep" />
+
+        {/* Pen options (only when pen mode) */}
+        {activeTool === 'pen' && (
+          <>
+            <div className="conti-tool">
+              <span className="conti-tool-label">size</span>
+              <input
+                type="range" min="0" max="100" step="0.5"
+                value={sizeToSlider(penSize)}
+                onChange={(e) => setPenSize(Math.round(sliderToSize(parseFloat(e.target.value)) * 10) / 10)}
+              />
+              <input
+                className="conti-num" type="number"
+                min={PEN_MIN} max={PEN_MAX} step="0.1"
+                value={penSize}
+                onChange={(e) => {
+                  const v = parseFloat(e.target.value);
+                  if (Number.isFinite(v)) setPenSize(Math.max(PEN_MIN, Math.min(PEN_MAX, v)));
+                }}
+              />
+              <span className="conti-tool-unit">px</span>
+            </div>
+
+            <div className="conti-tool">
+              <span className="conti-tool-label">opacity</span>
+              <input
+                type="range" min="0" max="100" step="1"
+                value={penOpacity}
+                onChange={(e) => setPenOpacity(parseInt(e.target.value, 10))}
+              />
+              <input
+                className="conti-num" type="number"
+                min="0" max="100" step="1"
+                value={penOpacity}
+                onChange={(e) => {
+                  const v = parseInt(e.target.value, 10);
+                  if (Number.isFinite(v)) setPenOpacity(Math.max(0, Math.min(100, v)));
+                }}
+              />
+              <span className="conti-tool-unit">%</span>
+            </div>
+
+            <div className="conti-pen-preview" title="현재 펜">
+              <div
+                className="conti-pen-dot"
+                style={{
+                  width: `${previewSize}px`,
+                  height: `${previewSize}px`,
+                  opacity: penOpacity / 100,
+                }}
+              />
+            </div>
+          </>
+        )}
+
+        {/* Lasso selection actions */}
+        {activeTool === 'lasso' && hasSelection && (
+          <div className="conti-sel-bar">
+            <span className="conti-sel-label">선택됨</span>
+            <button
+              className="conti-icon-btn"
+              onClick={copySelection}
+              title="복사 (Ctrl+C)"
+            >
+              ⎘ copy
+            </button>
+            <button
+              className="conti-icon-btn"
+              onClick={pasteSelection}
+              title="붙여넣기 (Ctrl+V)"
+              disabled={!hasClipboard}
+            >
+              ⎗ paste
+            </button>
+            <div className="conti-tool-sep" />
+            <button
+              className="conti-icon-btn"
+              onClick={() => flipSelection('h')}
+              title="수평 뒤집기"
+            >
+              ↔ flip H
+            </button>
+            <button
+              className="conti-icon-btn"
+              onClick={() => flipSelection('v')}
+              title="수직 뒤집기"
+            >
+              ↕ flip V
+            </button>
+            <div className="conti-tool-sep" />
+            <button
+              className="conti-icon-btn"
+              onClick={() => rotateSelectionDeg(-90)}
+              title="90° 반시계 회전"
+            >
+              ↺ 90°
+            </button>
+            <button
+              className="conti-icon-btn"
+              onClick={() => rotateSelectionDeg(90)}
+              title="90° 시계 회전"
+            >
+              ↻ 90°
+            </button>
+            <div className="conti-tool-sep" />
+            <button
+              className="conti-icon-btn"
+              onClick={() => {
+                const lasso = lassoRef.current;
+                if (lasso.frameId) {
+                  const fr = frames.find(f => f.id === lasso.frameId);
+                  applyLassoSelection(lasso.frameId, fr);
+                }
+              }}
+              title="선택 적용 (Esc)"
+            >
+              ✓ apply
+            </button>
+            <button
+              className="conti-icon-btn danger"
+              onClick={deleteSelection}
+              title="선택 삭제"
+            >
+              ✕ del
+            </button>
+          </div>
+        )}
+
+        {/* Paste when no selection but clipboard has content */}
+        {activeTool === 'lasso' && !hasSelection && hasClipboard && (
+          <button
+            className="conti-icon-btn"
+            onClick={pasteSelection}
+            title="붙여넣기"
+          >
+            ⎗ paste
+          </button>
+        )}
+
+        <div style={{ flex: 1 }} />
 
         <div className="conti-actions">
-          <button className="conti-icon-btn" onClick={undo} disabled={!selectedFrame}>↶ undo</button>
-          <button className="conti-icon-btn danger" onClick={clearAll} disabled={!selectedFrame}>clear all</button>
+          <button
+            className="conti-icon-btn"
+            onClick={undo}
+            disabled={!selectedFrame || lassoRef.current.phase !== 'idle'}
+          >
+            ↶ undo
+          </button>
+          <button
+            className="conti-icon-btn danger"
+            onClick={clearAll}
+            disabled={!selectedFrame}
+          >
+            clear all
+          </button>
         </div>
       </header>
 
@@ -1453,7 +2517,7 @@ export default function ContiProgram() {
               <div
                 key={f.id}
                 className={`conti-frame-row ${f.id === selectedFrameId ? 'active' : ''}`}
-                onClick={() => setSelectedFrameId(f.id)}
+                onClick={() => selectAndScrollToFrame(f.id)}
               >
                 <input
                   value={f.name}
@@ -1540,6 +2604,38 @@ export default function ContiProgram() {
               ))}
             </div>
           </div>
+
+          {/* Lasso tips */}
+          {activeTool === 'lasso' && (
+            <div className="conti-section">
+              <h3>lasso tips</h3>
+              <div style={{
+                fontSize: '11px',
+                color: 'var(--muted)',
+                fontFamily: 'Pretendard, sans-serif',
+                lineHeight: 1.6,
+              }}>
+                <div style={{ marginBottom: 4 }}>
+                  <strong style={{ color: 'var(--ink)' }}>그리기</strong> 영역을 자유롭게 드로잉
+                </div>
+                <div style={{ marginBottom: 4 }}>
+                  <strong style={{ color: 'var(--ink)' }}>이동</strong> 선택 안쪽 드래그
+                </div>
+                <div style={{ marginBottom: 4 }}>
+                  <strong style={{ color: 'var(--ink)' }}>크기</strong> □ 핸들 드래그
+                </div>
+                <div style={{ marginBottom: 4 }}>
+                  <strong style={{ color: 'var(--ink)' }}>회전</strong> ● 핸들 드래그
+                </div>
+                <div style={{ marginBottom: 4 }}>
+                  <strong style={{ color: 'var(--ink)' }}>적용</strong> 밖 클릭 or Apply
+                </div>
+                <div>
+                  <strong style={{ color: 'var(--ink)' }}>취소</strong> Esc
+                </div>
+              </div>
+            </div>
+          )}
         </aside>
 
         {/* canvas area */}
@@ -1555,6 +2651,8 @@ export default function ContiProgram() {
                 frame={f}
                 isSelected={f.id === selectedFrameId}
                 showDimensions={f.id === selectedFrameId}
+                activeTool={activeTool}
+                selectionPhase={selectionPhase}
                 getBlockBitmap={getBlockBitmapRef.current[f.id]}
                 onSelect={setSelectedFrameId}
                 onPointerDown={handlePointerDown}
@@ -1566,8 +2664,10 @@ export default function ContiProgram() {
 
           {selectedFrame && (
             <div className="conti-status">
-              <span className="dot" />
+              <span className={`dot ${activeTool === 'lasso' ? 'lasso' : ''}`} />
               <span>{selectedFrame.name}</span>
+              <span>·</span>
+              <span>{activeTool === 'lasso' ? (hasSelection ? '🟥 selected' : 'lasso') : 'pen'}</span>
               <span>·</span>
               <span>w {selectedFrame.canvasWidth}px</span>
               <span>·</span>
@@ -1595,42 +2695,62 @@ export default function ContiProgram() {
                 {selectedBlockLayout.map((b) => {
                   const showAbove = dragOverId === b.id && dragOverPos === 'above' && dragId !== b.id;
                   const showBelow = dragOverId === b.id && dragOverPos === 'below' && dragId !== b.id;
+                  const isCut = b.type === 'cut';
                   return (
-                    <div
-                      key={b.id}
-                      data-block-id={b.id}
-                      className={`conti-block-row ${dragId === b.id ? 'dragging' : ''}`}
-                    >
-                      {showAbove && <div className="drop-indicator above" />}
-                      <button
-                        className="conti-drag-handle"
-                        onPointerDown={(e) => handleHandlePointerDown(e, b.id)}
-                        onPointerMove={handleHandlePointerMove}
-                        onPointerUp={handleHandlePointerUp}
-                        onPointerCancel={handleHandlePointerUp}
-                        title="드래그해서 순서 변경"
-                        aria-label="drag to reorder"
+                    <div key={b.id} data-block-id={b.id}>
+                      {showAbove && <div className="drop-indicator above" style={{ position:'relative', height:3, background:'var(--accent)', borderRadius:2, margin:'0 0 2px 0' }} />}
+                      <div
+                        className={`conti-block-row${isCut ? ' has-margin' : ''} ${dragId === b.id ? 'dragging' : ''} ${b.id === activeBlockId ? 'viewport-active' : ''}`}
                       >
-                        <svg width="10" height="16" viewBox="0 0 10 16" fill="currentColor" aria-hidden="true">
-                          <circle cx="3" cy="3" r="1.2"/>
-                          <circle cx="7" cy="3" r="1.2"/>
-                          <circle cx="3" cy="8" r="1.2"/>
-                          <circle cx="7" cy="8" r="1.2"/>
-                          <circle cx="3" cy="13" r="1.2"/>
-                          <circle cx="7" cy="13" r="1.2"/>
-                        </svg>
-                      </button>
-                      <span className={`conti-block-tag ${b.type}`}>
-                        {b.type === 'cut' ? `c${String(b.num).padStart(2, '0')}` : 'gap'}
-                      </span>
-                      <input
-                        type="number" min="50" max="5000" step="50"
-                        value={b.height}
-                        onChange={(e) => updateBlockHeight(b.id, e.target.value)}
-                      />
-                      <span className="conti-tool-unit mono">px</span>
-                      <button className="del" onClick={() => removeBlock(b.id)} title="삭제">×</button>
-                      {showBelow && <div className="drop-indicator below" />}
+                        <button
+                          className="conti-drag-handle"
+                          onPointerDown={(e) => handleHandlePointerDown(e, b.id)}
+                          onPointerMove={handleHandlePointerMove}
+                          onPointerUp={handleHandlePointerUp}
+                          onPointerCancel={handleHandlePointerUp}
+                          title="드래그해서 순서 변경"
+                          aria-label="drag to reorder"
+                        >
+                          <svg width="10" height="16" viewBox="0 0 10 16" fill="currentColor" aria-hidden="true">
+                            <circle cx="3" cy="3" r="1.2"/>
+                            <circle cx="7" cy="3" r="1.2"/>
+                            <circle cx="3" cy="8" r="1.2"/>
+                            <circle cx="7" cy="8" r="1.2"/>
+                            <circle cx="3" cy="13" r="1.2"/>
+                            <circle cx="7" cy="13" r="1.2"/>
+                          </svg>
+                        </button>
+                        <span className={`conti-block-tag ${b.type}`}>
+                          {b.type === 'cut' ? `c${String(b.num).padStart(2, '0')}` : 'gap'}
+                        </span>
+                        <input
+                          type="number" min="50" max="5000" step="50"
+                          value={b.height}
+                          onChange={(e) => updateBlockHeight(b.id, e.target.value)}
+                        />
+                        <span className="conti-tool-unit mono">px</span>
+                        <button className="del" onClick={() => removeBlock(b.id)} title="삭제">×</button>
+                      </div>
+                      {isCut && (
+                        <div className={`conti-block-margin-row${b.id === activeBlockId ? ' viewport-active' : ''}`}>
+                          <span className="conti-margin-label">L</span>
+                          <input
+                            type="number" min="0" max="500" step="2"
+                            value={b.marginLeft ?? selectedFrame.sideMargin}
+                            onChange={(e) => updateBlockMargin(b.id, 'marginLeft', e.target.value)}
+                            title="왼쪽 margin"
+                          />
+                          <div className="conti-margin-sep" />
+                          <input
+                            type="number" min="0" max="500" step="2"
+                            value={b.marginRight ?? selectedFrame.sideMargin}
+                            onChange={(e) => updateBlockMargin(b.id, 'marginRight', e.target.value)}
+                            title="오른쪽 margin"
+                          />
+                          <span className="conti-margin-label">R</span>
+                        </div>
+                      )}
+                      {showBelow && <div className="drop-indicator below" style={{ position:'relative', height:3, background:'var(--accent)', borderRadius:2, margin:'2px 0 0 0' }} />}
                     </div>
                   );
                 })}
