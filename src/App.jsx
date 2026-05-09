@@ -466,7 +466,7 @@ const STYLES = `
   --layer-raster: #3a7bd5; --layer-vector: #6a3ad5;
   position: fixed; inset: 0; display: flex; flex-direction: column;
   font-family: 'Pretendard', -apple-system, system-ui, sans-serif;
-  color: var(--ink); background: var(--bg); user-select: none; -webkit-user-select: none; overflow: hidden;
+  color: var(--ink); background: var(--bg); user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; overflow: hidden;
 }
 .conti-root *, .conti-root *::before, .conti-root *::after { box-sizing: border-box; }
 .conti-root .mono { font-family: 'JetBrains Mono', ui-monospace, monospace; }
@@ -1027,7 +1027,7 @@ const FrameView = forwardRef(function FrameView({
               style={{ top: `${b.top}px`, left: `${ml}px`, width: `${bw}px`, height: `${b.height}px` }} />
           );
         })}
-        <canvas ref={canvasRef} className="conti-frame-canvas" style={{ touchAction: 'none' }} />
+        <canvas ref={canvasRef} className="conti-frame-canvas" style={{ touchAction: 'none' }} onContextMenu={e => e.preventDefault()} />
 
         {/* Vector bubble SVG layers */}
         {visibleVectorLayers.map(layer => {
@@ -1060,6 +1060,7 @@ const FrameView = forwardRef(function FrameView({
           ref={overlayRef}
           className={`conti-frame-overlay ${overlayCursorClass}`}
           style={{ touchAction: 'none', zIndex: isVectorActive ? 7 : 5 }}
+          onContextMenu={e => e.preventDefault()}
           onPointerDown={e => {
             onSelect(frame.id);
             if (isVectorActive) onBubbleOverlayPointerDown(e, frame.id, overlayRef.current, null);
@@ -1600,7 +1601,7 @@ export default function ContiProgram() {
       if (newBlockId == null) continue;
       const newBlockTop = tops[newBlockId];
       const newLocalPts = newFramePts.map(p => ({ x: p.x, y: p.y - newBlockTop }));
-      const newStroke = { points: newLocalPts, size: item.stroke.size, opacity: item.stroke.opacity, bbox: computeBbox(newLocalPts), hidden: false };
+      const newStroke = { points: newLocalPts, size: item.stroke.size, opacity: item.stroke.opacity, color: item.stroke.color, bbox: computeBbox(newLocalPts), hidden: false };
       if (!store.byBlock[newBlockId]) store.byBlock[newBlockId] = [];
       store.byBlock[newBlockId].push(newStroke);
       store.history.push({ layerId: item.layerId, blockId: newBlockId });
@@ -1928,6 +1929,24 @@ export default function ContiProgram() {
   // ===================================================================
   const handlePointerDown = (e, frameId, overlayEl) => {
     if (activeTool === 'lasso') { handleLassoPointerDown(e, frameId, overlayEl); return; }
+    if (e.pointerType === 'pen') {
+      e.preventDefault();
+      const frame = frames.find(f => f.id === frameId);
+      if (!frame || !overlayEl) return;
+      const activeLayerId = getActiveRasterLayerId(frame);
+      if (!activeLayerId) return;
+      try { overlayEl.setPointerCapture(e.pointerId); } catch(_) {}
+      const p = getCanvasPoint(e, overlayEl, frame);
+      drawingRef.current = { frameId, layerId: activeLayerId };
+      currentStrokeRef.current = { points: [p], size: penSize, opacity: penOpacity / 100, color: penColor };
+      const mc = frameRefs.current[frameId]?.getMainCanvas();
+      if (mc) {
+        const ctx = mc.getContext('2d');
+        ctx.fillStyle = hexToRgba(penColor, penOpacity / 100);
+        ctx.beginPath(); ctx.arc(p.x, p.y, penSize/2, 0, Math.PI*2); ctx.fill();
+      }
+      return;
+    }
     if (e.pointerType === 'touch') {
       activeTouchPointersRef.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
       if (activeTouchPointersRef.current.size >= 2) {
@@ -2033,7 +2052,7 @@ export default function ContiProgram() {
     const ownerTop = tops[ownerId];
     const localPoints = liveStroke.points.map(p => ({ x: p.x, y: p.y - ownerTop }));
     const simplified = rdpSimplify(localPoints, RDP_EPSILON);
-    const stored = { points: simplified, size: liveStroke.size, opacity: liveStroke.opacity, bbox: computeBbox(simplified), hidden: false };
+    const stored = { points: simplified, size: liveStroke.size, opacity: liveStroke.opacity, color: liveStroke.color, bbox: computeBbox(simplified), hidden: false };
     const store = ensureLayerStore(drawState.frameId, drawState.layerId);
     if (!store.byBlock[ownerId]) store.byBlock[ownerId] = [];
     store.byBlock[ownerId].push(stored);
