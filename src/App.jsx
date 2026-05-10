@@ -469,6 +469,12 @@ const STYLES = `
   color: var(--ink); background: var(--bg); user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; overflow: hidden;
 }
 .conti-root *, .conti-root *::before, .conti-root *::after { box-sizing: border-box; }
+/* iPad pen-drawing 안정화: 모든 자식에 callout/drag/tap-highlight 차단 (특히 iOS Safari에서 -webkit-touch-callout 가 상속되지 않는 경우 대비) */
+.conti-root, .conti-root * {
+  -webkit-touch-callout: none !important;
+  -webkit-user-drag: none;
+  -webkit-tap-highlight-color: transparent;
+}
 .conti-root .mono { font-family: 'JetBrains Mono', ui-monospace, monospace; }
 .conti-root button { font-family: inherit; cursor: pointer; border: none; background: none; color: inherit; }
 .conti-root input { font-family: inherit; }
@@ -651,13 +657,29 @@ const STYLES = `
   position: relative; background: var(--gap);
   box-shadow: 0 1px 2px rgba(0,0,0,0.04), 0 4px 12px rgba(0,0,0,0.06), 0 16px 40px rgba(0,0,0,0.08);
   transition: outline 0.12s ease;
+  /* 펜 입력시 iOS Scribble/선택 차단 */
+  touch-action: none;
+  -webkit-user-select: none; user-select: none;
+  -webkit-touch-callout: none;
 }
 .conti-frame.selected .conti-frame-stage { outline: 2px solid var(--accent); outline-offset: 4px; }
 .conti-block { position: absolute; pointer-events: none; }
 .conti-block.cut { background: var(--cut); }
 .conti-block.gap { background: var(--gap); }
-.conti-frame-canvas { position: absolute; top: 0; left: 0; display: block; pointer-events: none; }
-.conti-frame-overlay { position: absolute; top: 0; left: 0; display: block; z-index: 5; }
+.conti-frame-canvas {
+  position: absolute; top: 0; left: 0; display: block; pointer-events: none;
+  touch-action: none;
+  -webkit-user-select: none; user-select: none;
+  -webkit-touch-callout: none;
+}
+.conti-frame-overlay {
+  position: absolute; top: 0; left: 0; display: block; z-index: 5;
+  touch-action: none;
+  -webkit-user-select: none; user-select: none;
+  -webkit-touch-callout: none;
+  -webkit-tap-highlight-color: transparent;
+  -webkit-user-drag: none;
+}
 .conti-frame-overlay.tool-pen { cursor: crosshair; }
 .conti-frame-overlay.tool-lasso { cursor: cell; }
 .conti-frame-overlay.tool-lasso-selected { cursor: move; }
@@ -986,6 +1008,50 @@ const FrameView = forwardRef(function FrameView({
     }
     redraw();
   }, [frame.canvasWidth, totalHeight, redraw]);
+
+  // ===================================================================
+  // iPad / Apple Pencil 안정화:
+  // React의 합성 touch 이벤트는 iOS Safari에서 passive listener로 등록되어
+  // onPointerDown 안의 e.preventDefault() 가 OS의 기본동작(Scribble, 텍스트선택
+  // 콜아웃 = "공유..." 팝업, long-press 등)을 막지 못함.
+  // → overlay/stage 요소에 직접 native 리스너를 passive:false 로 등록해서
+  //   터치/제스처 단계에서 즉시 preventDefault 한다.
+  // ===================================================================
+  useEffect(() => {
+    const oc = overlayRef.current;
+    const stage = oc?.parentElement; // .conti-frame-stage
+    if (!oc) return;
+
+    const block = (e) => { if (e.cancelable) e.preventDefault(); };
+
+    // touch* : Scribble / 텍스트선택 콜아웃 / long-press 차단
+    oc.addEventListener('touchstart', block, { passive: false });
+    oc.addEventListener('touchmove', block, { passive: false });
+    oc.addEventListener('touchend', block, { passive: false });
+    oc.addEventListener('touchcancel', block, { passive: false });
+
+    // gesture* : iOS pinch-zoom / rotate 차단 (Safari 전용)
+    oc.addEventListener('gesturestart', block, { passive: false });
+    oc.addEventListener('gesturechange', block, { passive: false });
+    oc.addEventListener('gestureend', block, { passive: false });
+
+    // selectstart : 빠른 stroke 시작 시 텍스트 선택이 트리거되는 것 차단
+    const blockSelect = (e) => e.preventDefault();
+    oc.addEventListener('selectstart', blockSelect);
+    if (stage) stage.addEventListener('selectstart', blockSelect);
+
+    return () => {
+      oc.removeEventListener('touchstart', block);
+      oc.removeEventListener('touchmove', block);
+      oc.removeEventListener('touchend', block);
+      oc.removeEventListener('touchcancel', block);
+      oc.removeEventListener('gesturestart', block);
+      oc.removeEventListener('gesturechange', block);
+      oc.removeEventListener('gestureend', block);
+      oc.removeEventListener('selectstart', blockSelect);
+      if (stage) stage.removeEventListener('selectstart', blockSelect);
+    };
+  }, []);
 
   useImperativeHandle(ref, () => ({
     redraw,
@@ -1923,6 +1989,51 @@ export default function ContiProgram() {
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
   });
+
+  // ===================================================================
+  //  iPad / Apple Pencil 전역 안정화
+  //  - viewport meta 로 pinch-zoom 차단 (펜 좌표 어긋남 + 제스처 충돌 방지)
+  //  - document 레벨 gesturestart 차단
+  //  - 캔버스 영역 안에서 발생하는 selectstart 차단 (텍스트 선택 콜아웃="공유..." 방지)
+  // ===================================================================
+  useEffect(() => {
+    // viewport meta 동적 주입 (claude.ai/모바일 환경 대응)
+    let metaInjected = false;
+    let meta = document.querySelector('meta[name="viewport"]');
+    if (!meta) {
+      meta = document.createElement('meta');
+      meta.name = 'viewport';
+      document.head.appendChild(meta);
+      metaInjected = true;
+    }
+    const prevContent = meta.getAttribute('content');
+    meta.setAttribute(
+      'content',
+      'width=device-width, initial-scale=1.0, maximum-scale=1.0, minimum-scale=1.0, user-scalable=no, viewport-fit=cover'
+    );
+
+    // document 전역에서 iOS pinch/double-tap 제스처 차단
+    const blockGesture = (e) => { if (e.cancelable) e.preventDefault(); };
+    document.addEventListener('gesturestart', blockGesture, { passive: false });
+    document.addEventListener('gesturechange', blockGesture, { passive: false });
+    document.addEventListener('gestureend', blockGesture, { passive: false });
+
+    // 캔버스 영역 안에서 발생하는 selectstart 만 차단 (sidebar input 입력은 그대로)
+    const blockSelectInCanvas = (e) => {
+      const area = canvasAreaRef.current;
+      if (area && e.target && area.contains(e.target)) e.preventDefault();
+    };
+    document.addEventListener('selectstart', blockSelectInCanvas);
+
+    return () => {
+      document.removeEventListener('gesturestart', blockGesture);
+      document.removeEventListener('gesturechange', blockGesture);
+      document.removeEventListener('gestureend', blockGesture);
+      document.removeEventListener('selectstart', blockSelectInCanvas);
+      if (metaInjected && meta.parentNode) meta.parentNode.removeChild(meta);
+      else if (meta && prevContent != null) meta.setAttribute('content', prevContent);
+    };
+  }, []);
 
   // ===================================================================
   //  Pen pointer handlers
