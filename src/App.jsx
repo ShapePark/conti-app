@@ -1888,7 +1888,19 @@ export default function ContiProgram() {
     if (!frame) return;
     const p = getCanvasPoint(e, overlayEl, frame);
 
-    if (lasso.phase === 'drawing') { lasso.lassoPoints.push(p); renderSelectionOverlay(lasso.frameId); return; }
+    if (lasso.phase === 'drawing') {
+      // 라쏘도 빠른 펜 이동에서 점 누락 방지를 위해 coalesced events 활용
+      const native = e.nativeEvent || e;
+      const coalesced = (typeof native.getCoalescedEvents === 'function')
+        ? native.getCoalescedEvents()
+        : null;
+      if (coalesced && coalesced.length > 0) {
+        for (const ev of coalesced) lasso.lassoPoints.push(getCanvasPoint(ev, overlayEl, frame));
+      } else {
+        lasso.lassoPoints.push(p);
+      }
+      renderSelectionOverlay(lasso.frameId); return;
+    }
     if (lasso.phase === 'dragging') {
       lasso.transform = { ...lasso.origTransform, tx: lasso.origTransform.tx+(p.x-lasso.dragStart.x), ty: lasso.origTransform.ty+(p.y-lasso.dragStart.y) };
       renderSelectionOverlay(lasso.frameId); return;
@@ -2125,15 +2137,28 @@ export default function ContiProgram() {
     e.preventDefault();
     const frame = frames.find(f => f.id === drawingRef.current.frameId);
     if (!frame) return;
-    const p = getCanvasPoint(e, overlayEl, frame);
+
+    // ─── Apple Pencil 고해상도 입력 보정 ─────────────────────────────
+    // 브라우저는 240Hz 펜 좌표를 60Hz로 합쳐서 pointermove 한 번으로 전달.
+    // getCoalescedEvents() 로 원본 좌표를 다 꺼내서 그려야 빠른 stroke 가
+    // 끊김 없이 잡힌다. (Native event 가 있을 때만 — React 합성 이벤트는
+    // nativeEvent 안에서 꺼내야 함)
+    const native = e.nativeEvent || e;
+    const coalesced = (typeof native.getCoalescedEvents === 'function')
+      ? native.getCoalescedEvents()
+      : null;
+    const events = (coalesced && coalesced.length > 0) ? coalesced : [native];
+
     const s = currentStrokeRef.current;
-    const last = s.points[s.points.length - 1];
-    s.points.push(p);
     const mc = frameRefs.current[drawingRef.current.frameId]?.getMainCanvas();
-    if (mc) {
-      const ctx = mc.getContext('2d');
-      ctx.strokeStyle = hexToRgba(s.color || '#0F0F0F', s.opacity); ctx.lineWidth = s.size;
-      ctx.beginPath(); ctx.moveTo(last.x, last.y); ctx.lineTo(p.x, p.y); ctx.stroke();
+    const ctx = mc ? mc.getContext('2d') : null;
+    if (ctx) { ctx.strokeStyle = hexToRgba(s.color || '#0F0F0F', s.opacity); ctx.lineWidth = s.size; }
+
+    for (const ev of events) {
+      const p = getCanvasPoint(ev, overlayEl, frame);
+      const last = s.points[s.points.length - 1];
+      s.points.push(p);
+      if (ctx) { ctx.beginPath(); ctx.moveTo(last.x, last.y); ctx.lineTo(p.x, p.y); ctx.stroke(); }
     }
   };
 
@@ -2645,7 +2670,7 @@ export default function ContiProgram() {
           <div className="conti-brand-mark" />
           <div>
             <div className="conti-brand-name">콘티 프로그램</div>
-            <div className="conti-brand-version">conti.v10</div>
+            <div className="conti-brand-version">conti.v16</div>
           </div>
         </div>
 
