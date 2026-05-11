@@ -6,6 +6,8 @@ import React, {
 // ---------- ids ----------
 let _id = 0;
 const newId = () => ++_id;
+// 저장된 프로젝트를 불러올 때 ID 충돌을 막기 위해, 기존 데이터의 max id 보다 한 칸 위로 _id 카운터를 끌어올린다.
+const bumpIdTo = (n) => { if (Number.isFinite(n) && n > _id) _id = n; };
 
 // ---------- pen ----------
 const PEN_MIN = 0.1;
@@ -151,6 +153,278 @@ const hexToRgba = (hex, opacity) => {
   const g = parseInt(h.slice(2, 4), 16);
   const b = parseInt(h.slice(4, 6), 16);
   return `rgba(${r},${g},${b},${opacity})`;
+};
+
+// ===================================================================
+//  PROJECT STORAGE — IndexedDB primary, localStorage fallback
+//  (iPad Safari, desktop browsers, WKWebView App Store apps 모두 호환)
+// ===================================================================
+const SCHEMA_VERSION = 1;
+const APP_VERSION = 'conti.v19';
+const DB_NAME = 'conti_program_db';
+const DB_STORE = 'projects';
+const AUTOSAVE_ID = '__autosave__';
+const LS_FALLBACK_PREFIX = 'conti_program_proj_';
+const LS_AUTOSAVE_KEY = 'conti_program_autosave';
+
+// IndexedDB 사용 가능 여부 (Safari Private 모드 등에서는 막혀있을 수 있음)
+let _idbSupported = null;
+const idbSupported = () => {
+  if (_idbSupported !== null) return _idbSupported;
+  try { _idbSupported = typeof indexedDB !== 'undefined' && indexedDB !== null; }
+  catch (_) { _idbSupported = false; }
+  return _idbSupported;
+};
+
+const openDB = () => new Promise((resolve, reject) => {
+  if (!idbSupported()) { reject(new Error('IndexedDB unavailable')); return; }
+  const req = indexedDB.open(DB_NAME, 1);
+  req.onupgradeneeded = (e) => {
+    const db = e.target.result;
+    if (!db.objectStoreNames.contains(DB_STORE)) {
+      const store = db.createObjectStore(DB_STORE, { keyPath: 'id' });
+      store.createIndex('savedAt', 'savedAt', { unique: false });
+    }
+  };
+  req.onsuccess = () => resolve(req.result);
+  req.onerror = () => reject(req.error || new Error('IndexedDB open failed'));
+  req.onblocked = () => reject(new Error('IndexedDB blocked'));
+});
+
+const idbTx = async (mode) => {
+  const db = await openDB();
+  const tx = db.transaction(DB_STORE, mode);
+  return { db, tx, store: tx.objectStore(DB_STORE) };
+};
+
+const idbReq = (req) => new Promise((resolve, reject) => {
+  req.onsuccess = () => resolve(req.result);
+  req.onerror = () => reject(req.error || new Error('IDB request failed'));
+});
+
+// localStorage fallback helpers
+const lsListKeys = () => {
+  const out = [];
+  try {
+    for (let i = 0; i < localStorage.length; i++) {
+      const k = localStorage.key(i);
+      if (k && k.startsWith(LS_FALLBACK_PREFIX)) out.push(k);
+    }
+  } catch (_) {}
+  return out;
+};
+
+const ProjectStorage = {
+  // 모든 프로젝트 메타데이터 목록 (autosave 제외)
+  async listProjects() {
+    if (idbSupported()) {
+      try {
+        const { db, store } = await idbTx('readonly');
+        const all = await idbReq(store.getAll());
+        db.close();
+        return all
+          .filter(r => r.id !== AUTOSAVE_ID)
+          .map(r => ({ id: r.id, name: r.name, savedAt: r.savedAt, meta: r.meta || {} }))
+          .sort((a, b) => (b.savedAt || 0) - (a.savedAt || 0));
+      } catch (e) {
+        // fall through to localStorage
+      }
+    }
+    const out = [];
+    for (const k of lsListKeys()) {
+      try {
+        const raw = localStorage.getItem(k);
+        if (!raw) continue;
+        const r = JSON.parse(raw);
+        out.push({ id: r.id, name: r.name, savedAt: r.savedAt, meta: r.meta || {} });
+      } catch (_) {}
+    }
+    return out.sort((a, b) => (b.savedAt || 0) - (a.savedAt || 0));
+  },
+
+  async getProject(id) {
+    if (idbSupported()) {
+      try {
+        const { db, store } = await idbTx('readonly');
+        const rec = await idbReq(store.get(id));
+        db.close();
+        if (rec) return rec;
+      } catch (e) {}
+    }
+    try {
+      const raw = localStorage.getItem(LS_FALLBACK_PREFIX + id);
+      if (raw) return JSON.parse(raw);
+    } catch (_) {}
+    return null;
+  },
+
+  async saveProject(record) {
+    // record: { id, name, savedAt, meta, payload }
+    if (idbSupported()) {
+      try {
+        const { db, tx, store } = await idbTx('readwrite');
+        await idbReq(store.put(record));
+        await new Promise((res, rej) => { tx.oncomplete = res; tx.onerror = () => rej(tx.error); });
+        db.close();
+        return { ok: true, backend: 'idb' };
+      } catch (e) {
+        // fall through
+      }
+    }
+    try {
+      localStorage.setItem(LS_FALLBACK_PREFIX + record.id, JSON.stringify(record));
+      return { ok: true, backend: 'localStorage' };
+    } catch (e) {
+      return { ok: false, error: e?.message || 'storage failed' };
+    }
+  },
+
+  async deleteProject(id) {
+    if (idbSupported()) {
+      try {
+        const { db, tx, store } = await idbTx('readwrite');
+        await idbReq(store.delete(id));
+        await new Promise((res, rej) => { tx.oncomplete = res; tx.onerror = () => rej(tx.error); });
+        db.close();
+      } catch (_) {}
+    }
+    try { localStorage.removeItem(LS_FALLBACK_PREFIX + id); } catch (_) {}
+    return { ok: true };
+  },
+
+  async getAutosave() {
+    if (idbSupported()) {
+      try {
+        const { db, store } = await idbTx('readonly');
+        const rec = await idbReq(store.get(AUTOSAVE_ID));
+        db.close();
+        if (rec) return rec;
+      } catch (_) {}
+    }
+    try {
+      const raw = localStorage.getItem(LS_AUTOSAVE_KEY);
+      if (raw) return JSON.parse(raw);
+    } catch (_) {}
+    return null;
+  },
+
+  async setAutosave(record) {
+    const rec = { ...record, id: AUTOSAVE_ID };
+    if (idbSupported()) {
+      try {
+        const { db, tx, store } = await idbTx('readwrite');
+        await idbReq(store.put(rec));
+        await new Promise((res, rej) => { tx.oncomplete = res; tx.onerror = () => rej(tx.error); });
+        db.close();
+        return { ok: true, backend: 'idb' };
+      } catch (_) {}
+    }
+    try {
+      localStorage.setItem(LS_AUTOSAVE_KEY, JSON.stringify(rec));
+      return { ok: true, backend: 'localStorage' };
+    } catch (e) {
+      return { ok: false, error: e?.message || 'storage failed' };
+    }
+  },
+
+  async clearAutosave() {
+    if (idbSupported()) {
+      try {
+        const { db, tx, store } = await idbTx('readwrite');
+        await idbReq(store.delete(AUTOSAVE_ID));
+        await new Promise((res, rej) => { tx.oncomplete = res; tx.onerror = () => rej(tx.error); });
+        db.close();
+      } catch (_) {}
+    }
+    try { localStorage.removeItem(LS_AUTOSAVE_KEY); } catch (_) {}
+    return { ok: true };
+  },
+
+  // 대략적인 사용 용량 (KB)
+  async approximateSize() {
+    if (idbSupported() && navigator.storage?.estimate) {
+      try {
+        const est = await navigator.storage.estimate();
+        return { used: est.usage ?? 0, quota: est.quota ?? 0 };
+      } catch (_) {}
+    }
+    // localStorage fallback - rough estimate
+    let used = 0;
+    try {
+      for (const k of lsListKeys()) used += (localStorage.getItem(k) || '').length;
+      const auto = localStorage.getItem(LS_AUTOSAVE_KEY);
+      if (auto) used += auto.length;
+    } catch (_) {}
+    return { used: used * 2, quota: 5 * 1024 * 1024 }; // UTF-16 approx
+  },
+};
+
+// 페이로드 검증 — 잘못된 데이터로 앱이 깨지지 않게 한다
+const validatePayload = (data) => {
+  if (!data || typeof data !== 'object') return { ok: false, error: '데이터 형식이 잘못되었습니다' };
+  if (!Array.isArray(data.frames) || data.frames.length === 0) return { ok: false, error: 'frames 데이터가 없습니다' };
+  for (const f of data.frames) {
+    if (typeof f.id !== 'number') return { ok: false, error: 'frame id 가 잘못되었습니다' };
+    if (!Array.isArray(f.blocks) || !Array.isArray(f.layers)) return { ok: false, error: 'frame 구조가 잘못되었습니다' };
+  }
+  return { ok: true };
+};
+
+// 전체 데이터에서 가장 큰 numeric id 를 찾는다 (loaded 후 _id 카운터를 끌어올리기 위해)
+const findMaxIdInPayload = (data) => {
+  let max = 0;
+  const seen = (n) => { if (typeof n === 'number' && Number.isFinite(n) && n > max) max = n; };
+  if (data?.frames) {
+    for (const f of data.frames) {
+      seen(f.id);
+      if (Array.isArray(f.blocks)) for (const b of f.blocks) seen(b.id);
+      if (Array.isArray(f.layers)) for (const l of f.layers) seen(l.id);
+    }
+  }
+  if (data?.bubblesByLayer) {
+    for (const arr of Object.values(data.bubblesByLayer)) {
+      if (Array.isArray(arr)) for (const b of arr) seen(b.id);
+    }
+  }
+  if (data?.typoPresets) for (const p of data.typoPresets) seen(p.id);
+  return max;
+};
+
+// 다운로드 / 업로드 헬퍼 (.conti.json 파일)
+const triggerDownload = (filename, jsonString) => {
+  try {
+    const blob = new Blob([jsonString], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = filename; a.style.display = 'none';
+    document.body.appendChild(a); a.click();
+    setTimeout(() => { document.body.removeChild(a); URL.revokeObjectURL(url); }, 100);
+    return true;
+  } catch (_) { return false; }
+};
+
+const readFileAsText = (file) => new Promise((resolve, reject) => {
+  const r = new FileReader();
+  r.onload = () => resolve(r.result);
+  r.onerror = () => reject(r.error || new Error('파일 읽기 실패'));
+  r.readAsText(file);
+});
+
+const formatRelativeTime = (ts) => {
+  if (!ts) return '';
+  const diff = Date.now() - ts;
+  if (diff < 5_000) return '방금 전';
+  if (diff < 60_000) return `${Math.floor(diff / 1000)}초 전`;
+  if (diff < 3_600_000) return `${Math.floor(diff / 60_000)}분 전`;
+  if (diff < 86_400_000) return `${Math.floor(diff / 3_600_000)}시간 전`;
+  const d = new Date(ts);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')} ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+};
+
+const formatBytes = (n) => {
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  return `${(n / 1024 / 1024).toFixed(2)} MB`;
 };
 
 const renderStrokeToCtx = (ctx, stroke, yShift = 0) => {
@@ -414,7 +688,6 @@ const LayerRow = ({ layer, isActive, canMergeDown, onActivate, onToggleVisible,
         <button
           className="layer-drag-handle"
           onPointerDown={onDragHandlePointerDown}
-          onClick={e => e.stopPropagation()}
           title="드래그해서 순서 변경"
         >
           <svg width="10" height="16" viewBox="0 0 10 16" fill="currentColor">
@@ -434,7 +707,7 @@ const LayerRow = ({ layer, isActive, canMergeDown, onActivate, onToggleVisible,
           onClick={e => { e.stopPropagation(); setExpanded(v => !v); }}>⋯</button>
       </div>
       <div className="layer-row-opacity" onClick={e => e.stopPropagation()}>
-        <span className="layer-opacity-label">op</span>
+        <span className="layer-opacity-label" onClick={onActivate}>op</span>
         <input type="range" min="0" max="100" step="1" className="layer-opacity-slider"
           value={layer.opacity} onChange={e => onOpacityChange(parseInt(e.target.value, 10))} />
         <span className="layer-opacity-num">{layer.opacity}%</span>
@@ -452,6 +725,254 @@ const LayerRow = ({ layer, isActive, canMergeDown, onActivate, onToggleVisible,
     </div>
   );
 };
+
+// ===================================================================
+//  SAVE / LOAD DIALOG
+// ===================================================================
+const SaveLoadDialog = ({
+  open, onClose,
+  currentProjectId, currentProjectName,
+  onSaveCurrent, onSaveAsNew, onLoad, onDelete, onRename, onNewProject,
+  onExport, onImportFile,
+  storageBackend,
+}) => {
+  const [projects, setProjects] = useState([]);
+  const [busy, setBusy] = useState(false);
+  const [newName, setNewName] = useState('');
+  const [errorMsg, setErrorMsg] = useState('');
+  const [usage, setUsage] = useState({ used: 0, quota: 0 });
+  const fileInputRef = useRef(null);
+
+  const refresh = useCallback(async () => {
+    setBusy(true);
+    try {
+      const list = await ProjectStorage.listProjects();
+      setProjects(list);
+      const u = await ProjectStorage.approximateSize();
+      setUsage(u);
+    } catch (e) {
+      setErrorMsg(e?.message || '목록을 불러오지 못했습니다');
+    } finally {
+      setBusy(false);
+    }
+  }, []);
+
+  useEffect(() => { if (open) { refresh(); setErrorMsg(''); setNewName(''); } }, [open, refresh]);
+
+  if (!open) return null;
+
+  const handleSaveCurrent = async () => {
+    setBusy(true); setErrorMsg('');
+    try {
+      const r = await onSaveCurrent();
+      if (!r?.ok) setErrorMsg(r?.error || '저장 실패');
+      await refresh();
+    } catch (e) { setErrorMsg(e?.message || '저장 실패'); }
+    finally { setBusy(false); }
+  };
+
+  const handleSaveAsNew = async () => {
+    const name = newName.trim();
+    if (!name) { setErrorMsg('프로젝트 이름을 입력해주세요'); return; }
+    setBusy(true); setErrorMsg('');
+    try {
+      const r = await onSaveAsNew(name);
+      if (!r?.ok) setErrorMsg(r?.error || '저장 실패');
+      else { setNewName(''); }
+      await refresh();
+    } catch (e) { setErrorMsg(e?.message || '저장 실패'); }
+    finally { setBusy(false); }
+  };
+
+  const handleLoad = async (id, name) => {
+    if (!window.confirm(`"${name}"을(를) 불러옵니다.\n현재 작업중인 내용은 자동 저장된 상태로 남고, 이 프로젝트로 전환됩니다.`)) return;
+    setBusy(true); setErrorMsg('');
+    try {
+      const r = await onLoad(id);
+      if (!r?.ok) setErrorMsg(r?.error || '불러오기 실패');
+      else onClose();
+    } catch (e) { setErrorMsg(e?.message || '불러오기 실패'); }
+    finally { setBusy(false); }
+  };
+
+  const handleDelete = async (id, name) => {
+    if (!window.confirm(`"${name}"을(를) 삭제합니다. 이 동작은 되돌릴 수 없습니다.`)) return;
+    setBusy(true); setErrorMsg('');
+    try { await onDelete(id); await refresh(); }
+    catch (e) { setErrorMsg(e?.message || '삭제 실패'); }
+    finally { setBusy(false); }
+  };
+
+  const handleRename = async (id, oldName) => {
+    const next = window.prompt('새 이름을 입력해주세요', oldName);
+    if (next === null) return;
+    const trimmed = next.trim();
+    if (!trimmed || trimmed === oldName) return;
+    setBusy(true); setErrorMsg('');
+    try { await onRename(id, trimmed); await refresh(); }
+    catch (e) { setErrorMsg(e?.message || '이름 변경 실패'); }
+    finally { setBusy(false); }
+  };
+
+  const handleNew = async () => {
+    if (!window.confirm('새 프로젝트를 시작합니다.\n저장하지 않은 변경사항은 자동 저장본에 남지만, 새 프로젝트가 새로 자동 저장을 덮어쓰게 됩니다. 계속할까요?')) return;
+    setBusy(true);
+    try { await onNewProject(); onClose(); }
+    catch (e) { setErrorMsg(e?.message || '새 프로젝트 실패'); }
+    finally { setBusy(false); }
+  };
+
+  const handleExport = () => {
+    setErrorMsg('');
+    const r = onExport();
+    if (!r?.ok) setErrorMsg(r?.error || '내보내기 실패');
+  };
+
+  const handleImportClick = () => fileInputRef.current?.click();
+
+  const handleFileChange = async (e) => {
+    const file = e.target.files?.[0];
+    e.target.value = ''; // reset so same file can be picked again
+    if (!file) return;
+    if (!window.confirm(`"${file.name}"을(를) 불러옵니다.\n현재 작업중인 내용은 자동 저장된 상태로 남습니다.`)) return;
+    setBusy(true); setErrorMsg('');
+    try {
+      const r = await onImportFile(file);
+      if (!r?.ok) setErrorMsg(r?.error || '가져오기 실패');
+      else onClose();
+    } catch (err) { setErrorMsg(err?.message || '가져오기 실패'); }
+    finally { setBusy(false); }
+  };
+
+  return (
+    <div className="conti-modal-backdrop" onPointerDown={(e) => { if (e.target === e.currentTarget) onClose(); }}>
+      <div className="conti-modal" role="dialog" aria-modal="true">
+        <div className="conti-modal-header">
+          <div>
+            <div className="conti-modal-title">프로젝트 관리</div>
+            <div className="conti-modal-subtitle">
+              현재: <strong>{currentProjectName || '제목 없음'}</strong>
+              {storageBackend && <span className="conti-modal-tag mono">{storageBackend === 'idb' ? 'IndexedDB' : 'localStorage'}</span>}
+            </div>
+          </div>
+          <button className="conti-modal-close" onClick={onClose} aria-label="닫기">×</button>
+        </div>
+
+        {errorMsg && <div className="conti-modal-error">{errorMsg}</div>}
+
+        <div className="conti-modal-body">
+          {/* SAVE 영역 */}
+          <section className="conti-modal-section">
+            <h4>저장</h4>
+            <div className="conti-modal-save-row">
+              <button
+                className="conti-modal-btn primary"
+                disabled={busy || !currentProjectId}
+                onClick={handleSaveCurrent}
+                title={!currentProjectId ? '먼저 새 이름으로 저장해주세요' : '현재 프로젝트에 덮어쓰기'}
+              >
+                💾 현재 프로젝트에 저장
+              </button>
+            </div>
+            <div className="conti-modal-save-row">
+              <input
+                className="conti-modal-input"
+                placeholder="새 이름으로 저장 (예: 1화 콘티 v1)"
+                value={newName}
+                onChange={(e) => setNewName(e.target.value)}
+                onKeyDown={(e) => { if (e.key === 'Enter') handleSaveAsNew(); }}
+                disabled={busy}
+              />
+              <button className="conti-modal-btn" disabled={busy || !newName.trim()} onClick={handleSaveAsNew}>
+                + 새로 저장
+              </button>
+            </div>
+          </section>
+
+          {/* PROJECT 목록 */}
+          <section className="conti-modal-section">
+            <h4>저장된 프로젝트 <span className="conti-modal-count mono">{projects.length}</span></h4>
+            {projects.length === 0 ? (
+              <div className="conti-modal-empty">
+                {busy ? '불러오는 중...' : '저장된 프로젝트가 없습니다'}
+              </div>
+            ) : (
+              <div className="conti-modal-list">
+                {projects.map((p) => {
+                  const isCurrent = p.id === currentProjectId;
+                  const meta = p.meta || {};
+                  return (
+                    <div key={p.id} className={`conti-modal-item${isCurrent ? ' current' : ''}`}>
+                      <div className="conti-modal-item-main">
+                        <div className="conti-modal-item-name">
+                          {p.name}
+                          {isCurrent && <span className="conti-modal-current-badge">현재</span>}
+                        </div>
+                        <div className="conti-modal-item-meta mono">
+                          {formatRelativeTime(p.savedAt)}
+                          {meta.frames != null && ` · frames ${meta.frames}`}
+                          {meta.cuts != null && ` · cuts ${meta.cuts}`}
+                          {meta.strokes != null && ` · strokes ${meta.strokes}`}
+                          {meta.bubbles != null && ` · bubbles ${meta.bubbles}`}
+                        </div>
+                      </div>
+                      <div className="conti-modal-item-actions">
+                        <button className="conti-modal-btn small" disabled={busy} onClick={() => handleLoad(p.id, p.name)}>열기</button>
+                        <button className="conti-modal-btn small" disabled={busy} onClick={() => handleRename(p.id, p.name)}>이름</button>
+                        <button className="conti-modal-btn small danger" disabled={busy} onClick={() => handleDelete(p.id, p.name)}>삭제</button>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </section>
+
+          {/* EXPORT / IMPORT */}
+          <section className="conti-modal-section">
+            <h4>파일로 내보내기 · 가져오기</h4>
+            <div className="conti-modal-hint">
+              아이패드 ↔ 컴퓨터 사이를 옮기거나 백업하려면 파일로 내보내세요. .conti.json 파일이 다운로드됩니다.
+            </div>
+            <div className="conti-modal-save-row">
+              <button className="conti-modal-btn" disabled={busy} onClick={handleExport}>
+                ⬇ 현재 프로젝트 파일로 내보내기
+              </button>
+              <button className="conti-modal-btn" disabled={busy} onClick={handleImportClick}>
+                ⬆ 파일에서 가져오기
+              </button>
+              <input ref={fileInputRef} type="file" accept=".json,.conti,.conti.json,application/json"
+                style={{ display: 'none' }} onChange={handleFileChange} />
+            </div>
+          </section>
+
+          {/* NEW PROJECT */}
+          <section className="conti-modal-section">
+            <h4>새 프로젝트</h4>
+            <div className="conti-modal-hint">
+              모든 frames / strokes / 말풍선을 비우고 새로 시작합니다. 자동 저장본은 덮어써집니다.
+            </div>
+            <button className="conti-modal-btn danger" disabled={busy} onClick={handleNew}>
+              ⊕ 새 프로젝트 시작
+            </button>
+          </section>
+
+          {/* USAGE INFO */}
+          {usage.used > 0 && (
+            <section className="conti-modal-section">
+              <h4>저장 공간</h4>
+              <div className="conti-modal-usage mono">
+                사용량: {formatBytes(usage.used)}
+                {usage.quota > 0 && ` / ${formatBytes(usage.quota)}`}
+              </div>
+            </section>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+};
+
 
 // ---------- CSS ----------
 const STYLES = `
@@ -611,7 +1132,7 @@ const STYLES = `
 
 /* frame list */
 .conti-frame-row {
-  display: flex; align-items: center; gap: 4px; padding: 6px 8px; background: var(--paper);
+  display: flex; align-items: center; gap: 4px; padding: 6px 8px 6px 16px; background: var(--paper);
   border: 1px solid var(--line); border-radius: 5px; margin-bottom: 4px; cursor: pointer; transition: all 0.12s ease;
 }
 .conti-frame-row:hover { border-color: var(--ink-2); }
@@ -684,6 +1205,13 @@ const STYLES = `
 .conti-frame-overlay.tool-lasso { cursor: cell; }
 .conti-frame-overlay.tool-lasso-selected { cursor: move; }
 .conti-frame-overlay.tool-vector { cursor: default; }
+.conti-frame-overlay.tool-eraser { cursor: none; }
+.conti-eraser-cursor {
+  position: absolute; pointer-events: none; border-radius: 50%;
+  border: 2px solid rgba(0,0,0,0.55); background: rgba(255,255,255,0.25);
+  box-shadow: 0 0 0 1px rgba(255,255,255,0.6);
+  transform: translate(-50%, -50%); z-index: 10; transition: none;
+}
 .conti-bubble-svg { position: absolute; top: 0; left: 0; overflow: visible; pointer-events: none; }
 .conti-bubble-svg.interactive { pointer-events: all; z-index: 6; }
 
@@ -887,11 +1415,28 @@ const STYLES = `
   background: transparent; border: 1px solid transparent; border-radius: 3px; text-align: right; color: var(--ink);
 }
 .conti-block-row input:focus { outline: none; border-color: var(--line); background: var(--bg-panel); }
+.conti-block-row input[type="number"]::-webkit-inner-spin-button,
+.conti-block-row input[type="number"]::-webkit-outer-spin-button { -webkit-appearance: none; margin: 0; }
+.conti-block-row input[type="number"] { -moz-appearance: textfield; }
 .conti-block-row .del {
   width: 22px; height: 22px; display: flex; align-items: center; justify-content: center;
   font-size: 14px; color: var(--muted); border-radius: 3px; flex-shrink: 0; transition: all 0.12s ease;
 }
 .conti-block-row .del:hover { background: var(--accent-soft); color: var(--accent); }
+.block-height-stepper {
+  display: flex; flex-direction: column; flex-shrink: 0; gap: 0;
+  border: 1px solid var(--line); border-radius: 3px; overflow: hidden;
+}
+.block-height-btn {
+  width: 16px; height: 11px; display: flex; align-items: center; justify-content: center;
+  font-size: 8px; line-height: 1; flex-shrink: 0;
+  color: var(--muted); background: var(--bg-panel);
+  transition: color 0.1s ease, background 0.1s ease;
+  user-select: none;
+}
+.block-height-btn + .block-height-btn { border-top: 1px solid var(--line); }
+.block-height-btn:hover { color: var(--ink); background: var(--paper); }
+.block-height-btn:active { background: var(--line); }
 .conti-block-row.has-margin { border-radius: 5px 5px 0 0; margin-bottom: 0; }
 .conti-block-margin-row {
   display: flex; align-items: center; gap: 4px; padding: 4px 8px 6px 8px;
@@ -936,6 +1481,138 @@ const STYLES = `
   box-shadow: inset 3px 0 0 var(--accent);
 }
 
+/* ====== save status indicator (next to brand) ====== */
+.conti-save-status {
+  display: inline-flex; align-items: center; gap: 5px;
+  font-family: 'JetBrains Mono', monospace; font-size: 9px;
+  color: var(--muted); letter-spacing: 0.04em;
+}
+.conti-save-status .save-dot {
+  width: 5px; height: 5px; border-radius: 50%; background: var(--muted);
+  transition: background 0.2s ease;
+}
+.conti-save-status.saving .save-dot { background: #e0a82a; animation: contiSavePulse 1s ease-in-out infinite; }
+.conti-save-status.saved .save-dot { background: #6fc275; }
+.conti-save-status.error .save-dot { background: var(--accent); }
+@keyframes contiSavePulse { 0%, 100% { opacity: 0.4; } 50% { opacity: 1; } }
+
+/* ====== save/load modal ====== */
+.conti-modal-backdrop {
+  position: fixed; inset: 0; z-index: 1000;
+  background: rgba(22, 20, 15, 0.55);
+  display: flex; align-items: center; justify-content: center;
+  padding: 24px; backdrop-filter: blur(2px); -webkit-backdrop-filter: blur(2px);
+  animation: contiModalFade 0.18s ease-out;
+}
+@keyframes contiModalFade { from { opacity: 0; } to { opacity: 1; } }
+.conti-modal {
+  width: 100%; max-width: 640px; max-height: calc(100vh - 48px);
+  background: var(--bg); border: 1px solid var(--line);
+  border-radius: 10px; box-shadow: 0 20px 60px rgba(0,0,0,0.35);
+  display: flex; flex-direction: column; overflow: hidden;
+  animation: contiModalUp 0.22s cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+@keyframes contiModalUp { from { transform: translateY(8px) scale(0.98); opacity: 0; } to { transform: none; opacity: 1; } }
+.conti-modal-header {
+  display: flex; align-items: flex-start; justify-content: space-between;
+  padding: 18px 20px 14px; border-bottom: 1px solid var(--line); flex-shrink: 0;
+  gap: 12px;
+}
+.conti-modal-title { font-size: 15px; font-weight: 700; color: var(--ink); letter-spacing: -0.01em; }
+.conti-modal-subtitle {
+  margin-top: 4px; font-size: 11px; color: var(--muted);
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+}
+.conti-modal-subtitle strong { color: var(--ink-2); font-weight: 600; }
+.conti-modal-tag {
+  display: inline-block; padding: 1px 6px; font-size: 9px;
+  background: var(--bg-panel); border: 1px solid var(--line); border-radius: 3px;
+  color: var(--muted); letter-spacing: 0.06em;
+}
+.conti-modal-close {
+  width: 32px; height: 32px; flex-shrink: 0;
+  font-size: 22px; line-height: 1; color: var(--muted);
+  border-radius: 6px; transition: all 0.12s ease;
+}
+.conti-modal-close:hover { background: var(--bg-panel); color: var(--ink); }
+.conti-modal-error {
+  margin: 12px 20px 0; padding: 8px 12px;
+  background: var(--accent-soft); border: 1px solid rgba(196, 58, 44, 0.3);
+  border-radius: 5px; color: var(--accent); font-size: 12px;
+}
+.conti-modal-body {
+  padding: 16px 20px 20px; overflow-y: auto; flex: 1; min-height: 0;
+  display: flex; flex-direction: column; gap: 18px;
+}
+.conti-modal-section h4 {
+  margin: 0 0 8px 0;
+  font-family: 'JetBrains Mono', monospace; font-size: 10px; letter-spacing: 0.14em;
+  color: var(--muted); text-transform: uppercase; font-weight: 600;
+  display: flex; align-items: center; gap: 8px;
+}
+.conti-modal-count { color: var(--ink); font-size: 10px; }
+.conti-modal-hint { font-size: 11px; color: var(--muted); margin-bottom: 8px; line-height: 1.5; }
+.conti-modal-save-row {
+  display: flex; gap: 6px; margin-bottom: 6px; flex-wrap: wrap;
+}
+.conti-modal-input {
+  flex: 1; min-width: 180px; padding: 8px 10px; font-family: 'Pretendard', sans-serif; font-size: 13px;
+  background: var(--paper); border: 1px solid var(--line); border-radius: 5px; color: var(--ink);
+}
+.conti-modal-input:focus { outline: none; border-color: var(--ink); }
+.conti-modal-btn {
+  padding: 8px 14px; font-family: 'Pretendard', sans-serif; font-size: 12px; font-weight: 500;
+  color: var(--ink); background: var(--paper); border: 1px solid var(--line); border-radius: 5px;
+  transition: all 0.12s ease; white-space: nowrap;
+}
+.conti-modal-btn:hover:not(:disabled) { background: var(--bg-panel); border-color: var(--ink-2); }
+.conti-modal-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+.conti-modal-btn.primary { background: var(--ink); color: var(--paper); border-color: var(--ink); }
+.conti-modal-btn.primary:hover:not(:disabled) { background: var(--ink-2); border-color: var(--ink-2); }
+.conti-modal-btn.danger { color: var(--accent); border-color: rgba(196,58,44,0.4); }
+.conti-modal-btn.danger:hover:not(:disabled) { background: var(--accent-soft); border-color: var(--accent); }
+.conti-modal-btn.small { padding: 4px 9px; font-size: 11px; }
+.conti-modal-empty {
+  padding: 18px 12px; text-align: center; font-size: 12px; color: var(--muted);
+  border: 1px dashed var(--line); border-radius: 5px;
+}
+.conti-modal-list {
+  display: flex; flex-direction: column; gap: 5px;
+  max-height: 280px; overflow-y: auto;
+  padding-right: 2px;
+}
+.conti-modal-item {
+  display: flex; align-items: center; gap: 10px;
+  padding: 9px 12px; background: var(--paper);
+  border: 1px solid var(--line); border-radius: 6px; transition: border-color 0.12s ease;
+}
+.conti-modal-item:hover { border-color: var(--ink-2); }
+.conti-modal-item.current { border-color: var(--accent); background: var(--accent-soft); }
+.conti-modal-item-main { flex: 1; min-width: 0; }
+.conti-modal-item-name {
+  font-size: 13px; color: var(--ink); font-weight: 600;
+  display: flex; align-items: center; gap: 6px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.conti-modal-current-badge {
+  font-family: 'JetBrains Mono', monospace; font-size: 8px; letter-spacing: 0.08em;
+  padding: 1px 5px; background: var(--accent); color: var(--paper);
+  border-radius: 3px; text-transform: uppercase; font-weight: 600; flex-shrink: 0;
+}
+.conti-modal-item-meta { font-size: 10px; color: var(--muted); margin-top: 2px; }
+.conti-modal-item-actions { display: flex; gap: 4px; flex-shrink: 0; }
+.conti-modal-usage { font-size: 11px; color: var(--muted); }
+
+/* mobile/tablet */
+@media (max-width: 600px) {
+  .conti-modal-backdrop { padding: 10px; }
+  .conti-modal { max-height: calc(100vh - 20px); }
+  .conti-modal-body { padding: 12px 14px 16px; gap: 14px; }
+  .conti-modal-header { padding: 14px 16px 10px; }
+  .conti-modal-item { flex-wrap: wrap; }
+  .conti-modal-item-actions { width: 100%; justify-content: flex-end; }
+}
+
 @media (max-width: 900px) { .conti-sidebar.right { display: none; } }
 @media (max-width: 700px) { .conti-sidebar { width: 200px; flex: 0 0 200px; } .conti-tool input[type="range"] { width: 70px; } }
 `;
@@ -944,7 +1621,7 @@ const STYLES = `
 const FrameView = forwardRef(function FrameView({
   frame, isSelected, showDimensions, activeTool, selectionPhase,
   getLayerBitmap, bubblesByLayer, selectedBubble, activeLayerType,
-  typoPresets,
+  typoPresets, eraserSize, eraserCursor,
   onSelect, onPointerDown, onPointerMove, onPointerUp,
   onBubbleOverlayPointerDown, onBubbleOverlayPointerMove, onBubbleOverlayPointerUp,
 }, ref) {
@@ -1076,6 +1753,8 @@ const FrameView = forwardRef(function FrameView({
   } else if (activeTool === 'lasso') {
     overlayCursorClass = (['selected', 'dragging', 'resizing', 'rotating'].includes(selectionPhase))
       ? 'tool-lasso-selected' : 'tool-lasso';
+  } else if (activeTool === 'eraser') {
+    overlayCursorClass = 'tool-eraser';
   }
 
   const visibleVectorLayers = frame.layers.filter(l => l.visible && l.type === 'vector');
@@ -1150,6 +1829,14 @@ const FrameView = forwardRef(function FrameView({
           }}
         />
 
+        {/* Eraser cursor visual */}
+        {activeTool === 'eraser' && isSelected && eraserCursor && (
+          <div className="conti-eraser-cursor" style={{
+            left: eraserCursor.x, top: eraserCursor.y,
+            width: eraserSize, height: eraserSize,
+          }} />
+        )}
+
         {showDimensions && blockLayout.map(b => (
           <div key={`dim-${b.id}`} className={`conti-dim ${b.type}`}
             style={{ top: `${b.top}px`, height: `${b.height}px`, left: `${frame.canvasWidth + 10}px` }}>
@@ -1197,6 +1884,10 @@ export default function ContiProgram() {
   const [penOpacity, setPenOpacity] = useState(100);
   const [penColor, setPenColor] = useState('#0F0F0F');
 
+  // Eraser
+  const [eraserSize, setEraserSize] = useState(20);
+  const [eraserCursor, setEraserCursor] = useState(null); // {x, y} in viewport coords
+
   // Tool
   const [activeTool, setActiveTool] = useState('pen');
   const [hasSelection, setHasSelection] = useState(false);
@@ -1211,10 +1902,39 @@ export default function ContiProgram() {
   // Typography presets (사용자가 편집 가능한 6개)
   const [typoPresets, setTypoPresets] = useState(DEFAULT_TYPO_PRESETS);
 
+  // ===================================================================
+  //  PROJECT (save/load) state
+  // ===================================================================
+  const [saveDialogOpen, setSaveDialogOpen] = useState(false);
+  const [currentProjectId, setCurrentProjectId] = useState(null); // 저장된 프로젝트 id 또는 null
+  const [currentProjectName, setCurrentProjectName] = useState('');
+  // saveStatus: 'idle' | 'saving' | 'saved' | 'error' | 'dirty'
+  const [saveStatus, setSaveStatus] = useState('idle');
+  const [lastSaveAt, setLastSaveAt] = useState(0);
+  const [storageBackend, setStorageBackend] = useState(null); // 'idb' | 'localStorage' | null
+  // bumpRef를 늘리면 useEffect에서 (load 후) 모든 bitmap을 다시 그린다
+  const [loadGen, setLoadGen] = useState(0);
+  // 마운트 시 자동저장 복원을 한 번만 시도
+  const autosaveCheckedRef = useRef(false);
+  const autosaveTimerRef = useRef(null);
+  // 저장된 상태 표시 표지를 일정 시간 후 'idle' 로 되돌리기 위한 타이머
+  const savedFlashTimerRef = useRef(null);
+  // load 직후 자동저장이 다시 트리거되지 않도록 잠시 잠금
+  // 초기값 true: mount 시 자동저장본 복원 프롬프트가 끝날 때까지 자동저장 금지
+  // (사용자가 "복원하지 않음"을 선택하면 그 사이에 빈 frame 이 자동저장을 덮어쓰는 걸 방지)
+  const autosaveLockRef = useRef(true);
+  // setLastSaveAt 의 최신값을 effect 안에서 안전하게 접근하기 위한 ref
+  const lastSaveAtRef = useRef(0);
+  useEffect(() => { lastSaveAtRef.current = lastSaveAt; }, [lastSaveAt]);
+  // useCallback hooks 안에서 (의존성 추가 없이) 최신 requestAutosave 를 호출하기 위한 ref
+  const requestAutosaveRef = useRef(null);
+
+
   const bubbleInterRef = useRef({ mode: null, frameId: null, layerId: null, bubbleId: null, startX: 0, startY: 0, origBubble: null });
 
   const drawingRef = useRef(null);
   const currentStrokeRef = useRef(null);
+  const eraserRef = useRef({ active: false, frameId: null, layerId: null, erasedSet: new Set() });
 
   const lassoRef = useRef({
     phase: 'idle', frameId: null, layerId: null,
@@ -1286,12 +2006,63 @@ export default function ContiProgram() {
     if (!activeLayerId) return;
     const store = ensureLayerStore(selectedFrameId, activeLayerId);
     if (!store.history.length) return;
-    const { layerId, blockId } = store.history.pop();
-    const arr = store.byBlock[blockId];
-    if (arr && arr.length > 0) arr.pop();
-    const block = selectedFrame.blocks.find(b => b.id === blockId);
-    if (block) rebuildBlockBitmap(selectedFrameId, layerId, block, selectedFrame.canvasWidth);
+    const last = store.history[store.history.length - 1];
+    if (last.type === 'erase') {
+      store.history.pop();
+      const dirtyBlocks = new Set();
+      for (const stroke of last.strokes) {
+        stroke.hidden = false;
+        for (const [blockId, arr] of Object.entries(store.byBlock)) {
+          if (arr.includes(stroke)) { dirtyBlocks.add(Number(blockId)); break; }
+        }
+      }
+      for (const blockId of dirtyBlocks) {
+        const block = selectedFrame.blocks.find(b => b.id === blockId);
+        if (block) rebuildBlockBitmap(selectedFrameId, activeLayerId, block, selectedFrame.canvasWidth);
+      }
+    } else if (last.type === 'lasso-apply') {
+      // 올가미 이동/변형 undo: 새로 배치된 stroke 제거 + 원본 stroke 복원
+      store.history.pop();
+      const dirtyBlocks = new Set();
+      for (const { blockId, stroke } of last.added) {
+        const arr = store.byBlock[blockId];
+        if (arr) { const idx = arr.indexOf(stroke); if (idx >= 0) arr.splice(idx, 1); }
+        dirtyBlocks.add(blockId);
+      }
+      for (const { blockId, stroke } of last.restored) {
+        if (!store.byBlock[blockId]) store.byBlock[blockId] = [];
+        stroke.hidden = false;
+        store.byBlock[blockId].push(stroke);
+        dirtyBlocks.add(blockId);
+      }
+      for (const blockId of dirtyBlocks) {
+        const block = selectedFrame.blocks.find(b => b.id === blockId);
+        if (block) rebuildBlockBitmap(selectedFrameId, activeLayerId, block, selectedFrame.canvasWidth);
+      }
+    } else if (last.type === 'lasso-delete') {
+      // 올가미 삭제 undo: 삭제된 stroke 복원
+      store.history.pop();
+      const dirtyBlocks = new Set();
+      for (const { blockId, stroke } of last.restored) {
+        if (!store.byBlock[blockId]) store.byBlock[blockId] = [];
+        stroke.hidden = false;
+        store.byBlock[blockId].push(stroke);
+        dirtyBlocks.add(blockId);
+      }
+      for (const blockId of dirtyBlocks) {
+        const block = selectedFrame.blocks.find(b => b.id === blockId);
+        if (block) rebuildBlockBitmap(selectedFrameId, activeLayerId, block, selectedFrame.canvasWidth);
+      }
+    } else {
+      store.history.pop();
+      const { blockId } = last;
+      const arr = store.byBlock[blockId];
+      if (arr && arr.length > 0) arr.pop();
+      const block = selectedFrame.blocks.find(b => b.id === blockId);
+      if (block) rebuildBlockBitmap(selectedFrameId, activeLayerId, block, selectedFrame.canvasWidth);
+    }
     frameRefs.current[selectedFrameId]?.redraw();
+    requestAutosaveRef.current?.();
   }, [selectedFrame, selectedFrameId, getActiveRasterLayerId, ensureLayerStore, rebuildBlockBitmap]);
 
   const getLayerBitmapRef = useRef({});
@@ -1652,13 +2423,21 @@ export default function ContiProgram() {
     const { cx, cy } = bbox;
     const tops = computeBlockTops(frame.blocks);
     const dirtyByLayer = {};
+    // 올가미 apply 전체를 하나의 배치 히스토리 엔트리로 기록 (undo 대응)
+    const lassoHistoryAdded = [];   // 새로 배치된 stroke들
+    const lassoHistoryRestored = []; // 원본 위치 stroke들 (undo 시 복원)
+    let lassoHistoryLayerId = null;
+    let lassoHistoryStore = null;
 
     for (const item of selectedItems) {
       const store = ensureLayerStore(frameId, item.layerId);
+      if (!lassoHistoryStore) { lassoHistoryStore = store; lassoHistoryLayerId = item.layerId; }
       const origArr = store.byBlock[item.blockId];
       if (origArr) { const idx = origArr.indexOf(item.stroke); if (idx >= 0) origArr.splice(idx, 1); }
       if (!dirtyByLayer[item.layerId]) dirtyByLayer[item.layerId] = new Set();
       dirtyByLayer[item.layerId].add(item.blockId);
+      // 원본 stroke 복원 정보 수집
+      lassoHistoryRestored.push({ blockId: item.blockId, stroke: item.stroke });
 
       const newFramePts = item.framePoints.map(p => applySelectionTransform(p.x, p.y, cx, cy, transform));
       const centX = newFramePts.reduce((s,p)=>s+p.x,0)/newFramePts.length;
@@ -1670,8 +2449,13 @@ export default function ContiProgram() {
       const newStroke = { points: newLocalPts, size: item.stroke.size, opacity: item.stroke.opacity, color: item.stroke.color, bbox: computeBbox(newLocalPts), hidden: false };
       if (!store.byBlock[newBlockId]) store.byBlock[newBlockId] = [];
       store.byBlock[newBlockId].push(newStroke);
-      store.history.push({ layerId: item.layerId, blockId: newBlockId });
+      // 새 stroke 정보 수집 (undo 시 제거 대상)
+      lassoHistoryAdded.push({ blockId: newBlockId, stroke: newStroke });
       dirtyByLayer[item.layerId].add(newBlockId);
+    }
+    // 배치 히스토리 엔트리 1개로 push (개별 push 대신)
+    if (lassoHistoryStore && (lassoHistoryAdded.length > 0 || lassoHistoryRestored.length > 0)) {
+      lassoHistoryStore.history.push({ type: 'lasso-apply', added: lassoHistoryAdded, restored: lassoHistoryRestored });
     }
 
     for (const [layerId, blockIds] of Object.entries(dirtyByLayer))
@@ -1683,6 +2467,7 @@ export default function ContiProgram() {
     lasso.phase = 'idle'; lasso.selectedItems = []; lasso.bbox = null; lasso.frameId = null;
     frameRefs.current[frameId]?.clearOverlay();
     setHasSelection(false); setSelectionPhase('idle');
+    requestAutosave();
   };
 
   // ===================================================================
@@ -1751,6 +2536,7 @@ export default function ContiProgram() {
       if (block) rebuildBlockBitmap(selectedFrameId, activeLayerId, block, selectedFrame.canvasWidth);
     }
     frameRefs.current[selectedFrameId]?.redraw();
+    requestAutosave();
   };
 
   const flipSelection = (axis) => {
@@ -1773,12 +2559,21 @@ export default function ContiProgram() {
     const frameId = lasso.frameId;
     const frame = frames.find(f => f.id === frameId);
     const dirtyByLayer = {};
+    // 삭제된 stroke들의 복원 정보 수집 (undo 대응)
+    const lassoDeleteRestored = [];
+    let lassoDeleteStore = null;
     for (const item of lasso.selectedItems) {
       const store = ensureLayerStore(frameId, item.layerId);
+      if (!lassoDeleteStore) lassoDeleteStore = store;
       const arr = store.byBlock[item.blockId];
       if (arr) { const idx = arr.indexOf(item.stroke); if (idx >= 0) arr.splice(idx, 1); }
+      lassoDeleteRestored.push({ blockId: item.blockId, stroke: item.stroke });
       if (!dirtyByLayer[item.layerId]) dirtyByLayer[item.layerId] = new Set();
       dirtyByLayer[item.layerId].add(item.blockId);
+    }
+    // 배치 히스토리 엔트리 push
+    if (lassoDeleteStore && lassoDeleteRestored.length > 0) {
+      lassoDeleteStore.history.push({ type: 'lasso-delete', restored: lassoDeleteRestored });
     }
     for (const [layerId, blockIds] of Object.entries(dirtyByLayer))
       for (const blockId of blockIds) {
@@ -1789,6 +2584,7 @@ export default function ContiProgram() {
     lasso.phase = 'idle'; lasso.selectedItems = []; lasso.bbox = null; lasso.frameId = null;
     frameRefs.current[frameId]?.clearOverlay();
     setHasSelection(false); setSelectionPhase('idle');
+    requestAutosave();
   };
 
   // ===================================================================
@@ -1993,6 +2789,12 @@ export default function ContiProgram() {
           else cancelLassoSelection(lasso.frameId, fr);
         }
       }
+      // Shortcut keys: P = pen, L = lasso, E = eraser
+      if (!['INPUT','TEXTAREA'].includes(tag)) {
+        if (e.key === 'p' || e.key === 'P') switchTool('pen');
+        if (e.key === 'l' || e.key === 'L') switchTool('lasso');
+        if (e.key === 'e' || e.key === 'E') switchTool('eraser');
+      }
       if ((e.key === 'Delete' || e.key === 'Backspace') && selectedBubble
         && !['INPUT','TEXTAREA'].includes(document.activeElement.tagName)) {
         deleteBubble(selectedBubble.layerId, selectedBubble.bubbleId);
@@ -2048,10 +2850,79 @@ export default function ContiProgram() {
   }, []);
 
   // ===================================================================
+  //  ERASER helper — hide strokes whose points fall within eraserRadius
+  // ===================================================================
+  const eraseAtPoint = useCallback((frameId, frame, layerId, eraserX, eraserY, eraserRadius) => {
+    const tops = computeBlockTops(frame.blocks);
+    const store = strokesByFrameRef.current[frameId]?.[layerId];
+    if (!store) return;
+    const r2 = eraserRadius * eraserRadius;
+    const dirtyBlocks = new Set();
+    for (const block of frame.blocks) {
+      const blockTop = tops[block.id];
+      const localY = eraserY - blockTop;
+      const arr = store.byBlock[block.id];
+      if (!arr) continue;
+      for (const stroke of arr) {
+        if (stroke.hidden) continue;
+        // Quick bbox reject
+        if (stroke.bbox.maxX < eraserX - eraserRadius || stroke.bbox.minX > eraserX + eraserRadius) continue;
+        if (stroke.bbox.maxY < localY - eraserRadius || stroke.bbox.minY > localY + eraserRadius) continue;
+        // Point-level check
+        let hit = false;
+        for (const p of stroke.points) {
+          const dx = p.x - eraserX, dy = p.y - localY;
+          if (dx * dx + dy * dy <= r2) { hit = true; break; }
+        }
+        if (hit) {
+          stroke.hidden = true;
+          dirtyBlocks.add(block.id);
+          eraserRef.current.erasedSet.add(stroke);
+        }
+      }
+    }
+    for (const blockId of dirtyBlocks) {
+      const block = frame.blocks.find(b => b.id === blockId);
+      if (block) rebuildBlockBitmap(frameId, layerId, block, frame.canvasWidth);
+    }
+    if (dirtyBlocks.size > 0) frameRefs.current[frameId]?.redraw();
+  }, [rebuildBlockBitmap]);
+
+  // ===================================================================
   //  Pen pointer handlers
   // ===================================================================
   const handlePointerDown = (e, frameId, overlayEl) => {
     if (activeTool === 'lasso') { handleLassoPointerDown(e, frameId, overlayEl); return; }
+    if (activeTool === 'eraser') {
+      if (e.pointerType === 'touch') {
+        activeTouchPointersRef.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
+        if (activeTouchPointersRef.current.size >= 2) {
+          if (!panStateRef.current) {
+            const pts = [...activeTouchPointersRef.current.values()];
+            panStateRef.current = { lastX: pts.reduce((s,p)=>s+p.x,0)/pts.length, lastY: pts.reduce((s,p)=>s+p.y,0)/pts.length };
+          }
+          // 지우개 툴에서도 two-finger tap undo 감지를 위해 twoFingerTapRef 설정
+          if (activeTouchPointersRef.current.size === 2) {
+            twoFingerTapRef.current = {
+              active: true,
+              startMap: new Map([...activeTouchPointersRef.current.entries()].map(([k,v]) => [k, { x: v.x, y: v.y }])),
+              moved: false,
+            };
+          }
+          try { overlayEl?.releasePointerCapture(e.pointerId); } catch(_) {} return;
+        }
+      }
+      e.preventDefault();
+      const frame = frames.find(f => f.id === frameId);
+      if (!frame || !overlayEl) return;
+      const activeLayerId = getActiveRasterLayerId(frame);
+      if (!activeLayerId) return;
+      try { overlayEl.setPointerCapture(e.pointerId); } catch(_) {}
+      const p = getCanvasPoint(e, overlayEl, frame);
+      eraserRef.current = { active: true, frameId, layerId: activeLayerId, erasedSet: new Set() };
+      eraseAtPoint(frameId, frame, activeLayerId, p.x, p.y, eraserSize / 2);
+      return;
+    }
     if (e.pointerType === 'pen') {
       e.preventDefault();
       const frame = frames.find(f => f.id === frameId);
@@ -2108,6 +2979,45 @@ export default function ContiProgram() {
 
   const handlePointerMove = (e, overlayEl) => {
     if (activeTool === 'lasso') { handleLassoPointerMove(e, overlayEl); return; }
+    if (activeTool === 'eraser') {
+      // Update eraser cursor position
+      if (overlayEl) {
+        const rect = overlayEl.getBoundingClientRect();
+        setEraserCursor({ x: e.clientX - rect.left, y: e.clientY - rect.top, frameEl: overlayEl });
+      }
+      if (e.pointerType === 'touch') {
+        if (activeTouchPointersRef.current.has(e.pointerId))
+          activeTouchPointersRef.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
+        if (activeTouchPointersRef.current.size >= 2) {
+          // 지우개 툴에서도 two-finger tap vs pan 구분
+          if (twoFingerTapRef.current.active && !twoFingerTapRef.current.moved) {
+            const TAP_THRESHOLD = 15;
+            for (const [pid, pos] of activeTouchPointersRef.current.entries()) {
+              const start = twoFingerTapRef.current.startMap?.get(pid);
+              if (start && (Math.abs(pos.x - start.x) > TAP_THRESHOLD || Math.abs(pos.y - start.y) > TAP_THRESHOLD)) {
+                twoFingerTapRef.current.moved = true; break;
+              }
+            }
+          }
+          if (panStateRef.current && canvasAreaRef.current) {
+            const pts = [...activeTouchPointersRef.current.values()];
+            const avgX = pts.reduce((s,p)=>s+p.x,0)/pts.length;
+            const avgY = pts.reduce((s,p)=>s+p.y,0)/pts.length;
+            canvasAreaRef.current.scrollLeft -= avgX - panStateRef.current.lastX;
+            canvasAreaRef.current.scrollTop -= avgY - panStateRef.current.lastY;
+            panStateRef.current = { lastX: avgX, lastY: avgY };
+          }
+          return;
+        }
+      }
+      if (!eraserRef.current.active) return;
+      e.preventDefault();
+      const frame = frames.find(f => f.id === eraserRef.current.frameId);
+      if (!frame || !overlayEl) return;
+      const p = getCanvasPoint(e, overlayEl, frame);
+      eraseAtPoint(eraserRef.current.frameId, frame, eraserRef.current.layerId, p.x, p.y, eraserSize / 2);
+      return;
+    }
     if (e.pointerType === 'touch') {
       if (activeTouchPointersRef.current.has(e.pointerId))
         activeTouchPointersRef.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
@@ -2150,20 +3060,50 @@ export default function ContiProgram() {
     const events = (coalesced && coalesced.length > 0) ? coalesced : [native];
 
     const s = currentStrokeRef.current;
-    const mc = frameRefs.current[drawingRef.current.frameId]?.getMainCanvas();
-    const ctx = mc ? mc.getContext('2d') : null;
-    if (ctx) { ctx.strokeStyle = hexToRgba(s.color || '#0F0F0F', s.opacity); ctx.lineWidth = s.size; }
 
+    // 먼저 이번 프레임의 모든 포인트를 수집한다
     for (const ev of events) {
       const p = getCanvasPoint(ev, overlayEl, frame);
-      const last = s.points[s.points.length - 1];
       s.points.push(p);
-      if (ctx) { ctx.beginPath(); ctx.moveTo(last.x, last.y); ctx.lineTo(p.x, p.y); ctx.stroke(); }
+    }
+
+    // 커밋된 비트맵을 다시 그린 뒤, 현재 stroke 전체를 하나의 path로 그린다.
+    // (세그먼트별 개별 stroke() 방식은 round cap 겹침으로 불투명도가 중첩돼
+    //  원들이 보이는 문제가 생기므로, 전체 경로를 단일 stroke()로 처리한다.)
+    const fref = frameRefs.current[drawingRef.current.frameId];
+    if (fref) {
+      fref.redraw();
+      const mc = fref.getMainCanvas();
+      if (mc) renderStrokeToCtx(mc.getContext('2d'), s, 0);
     }
   };
 
   const handlePointerUp = (e, overlayEl) => {
     if (activeTool === 'lasso') { handleLassoPointerUp(e, overlayEl); return; }
+    if (activeTool === 'eraser') {
+      if (e.pointerType === 'touch') {
+        activeTouchPointersRef.current.delete(e.pointerId);
+        // 지우개 툴에서도 two-finger tap → undo 트리거
+        if (activeTouchPointersRef.current.size === 1 && twoFingerTapRef.current.active && !twoFingerTapRef.current.moved) {
+          twoFingerTapRef.current = { active: false, startMap: null, moved: false };
+          undoLastStroke();
+          panStateRef.current = null;
+          return;
+        }
+        if (activeTouchPointersRef.current.size === 0) twoFingerTapRef.current = { active: false, startMap: null, moved: false };
+        if (activeTouchPointersRef.current.size < 2) panStateRef.current = null;
+      }
+      setEraserCursor(null);
+      if (!eraserRef.current.active) return;
+      const { frameId, layerId, erasedSet } = eraserRef.current;
+      eraserRef.current = { active: false, frameId: null, layerId: null, erasedSet: new Set() };
+      if (erasedSet.size > 0) {
+        const store = ensureLayerStore(frameId, layerId);
+        store.history.push({ type: 'erase', layerId, strokes: [...erasedSet] });
+        requestAutosave();
+      }
+      return;
+    }
     if (e.pointerType === 'touch') {
       activeTouchPointersRef.current.delete(e.pointerId);
       // Two-finger tap (no significant movement) → undo last stroke
@@ -2195,6 +3135,7 @@ export default function ContiProgram() {
     store.history.push({ layerId: drawState.layerId, blockId: ownerId });
     const entry = ensureBlockBitmap(drawState.frameId, drawState.layerId, ownerBlock, frame.canvasWidth, stored.bbox.maxY);
     renderStrokeToCtx(entry.ctx, stored, BITMAP_Y_PADDING);
+    requestAutosave();
   };
 
   // ===================================================================
@@ -2626,6 +3567,7 @@ export default function ContiProgram() {
     const block = selectedFrame.blocks.find(b => b.id === last.blockId);
     if (block) rebuildBlockBitmap(selectedFrameId, activeLayerId, block, selectedFrame.canvasWidth);
     frameRefs.current[selectedFrameId]?.redraw();
+    requestAutosave();
   };
 
   const clearAll = () => {
@@ -2636,7 +3578,443 @@ export default function ContiProgram() {
     const fStore = strokesByFrameRef.current[selectedFrameId] || {};
     for (const ls of Object.values(fStore)) { ls.byBlock = {}; ls.bitmaps = {}; ls.history = []; }
     frameRefs.current[selectedFrameId]?.redraw();
+    requestAutosave();
   };
+
+  // ===================================================================
+  //  PROJECT SAVE / LOAD logic
+  // ===================================================================
+
+  // 현재 작업 상태를 통째로 직렬화 가능한 객체로 변환한다.
+  // bitmap (canvas) 과 history (undo stack) 는 저장하지 않고, 불러올 때 strokes 로부터 다시 만든다.
+  const serializeProject = useCallback(() => {
+    const strokes = {};
+    const ref = strokesByFrameRef.current || {};
+    for (const fid of Object.keys(ref)) {
+      const layerMap = ref[fid] || {};
+      const layerOut = {};
+      let hasAny = false;
+      for (const lid of Object.keys(layerMap)) {
+        const ls = layerMap[lid];
+        if (!ls?.byBlock) continue;
+        const blocksOut = {};
+        let layerHasAny = false;
+        for (const bid of Object.keys(ls.byBlock)) {
+          const arr = ls.byBlock[bid] || [];
+          if (arr.length === 0) continue;
+          // hidden / bbox 는 저장하지 않는다 — bbox 는 load 시 computeBbox 로 재생성, hidden 은 false 가 디폴트
+          // hidden 스트로크는 지워진 것으로 간주하여 저장에서 제외
+          const visibleStrokes = arr.filter(s => !s.hidden);
+          if (visibleStrokes.length === 0) continue;
+          blocksOut[bid] = visibleStrokes.map(s => ({
+            points: s.points.map(p => ({ x: p.x, y: p.y })),
+            size: s.size,
+            opacity: s.opacity,
+            color: s.color || '#0F0F0F',
+          }));
+          layerHasAny = true;
+        }
+        if (layerHasAny) { layerOut[lid] = blocksOut; hasAny = true; }
+      }
+      if (hasAny) strokes[fid] = layerOut;
+    }
+    return {
+      frames: frames.map(f => ({
+        id: f.id,
+        name: f.name,
+        canvasWidth: f.canvasWidth,
+        sideMargin: f.sideMargin,
+        activeLayerId: f.activeLayerId,
+        blocks: f.blocks.map(b => ({ ...b })),
+        layers: f.layers.map(l => ({ ...l })),
+      })),
+      selectedFrameId,
+      bubblesByLayer: JSON.parse(JSON.stringify(bubblesByLayer)),
+      typoPresets: typoPresets.map(p => ({ ...p })),
+      strokes,
+    };
+  }, [frames, selectedFrameId, bubblesByLayer, typoPresets]);
+
+  // 메타데이터 (목록에 보여지는 통계)
+  const computeProjectMeta = useCallback((data) => {
+    let cuts = 0, strokes = 0, bubbles = 0;
+    for (const f of data.frames || []) {
+      for (const b of (f.blocks || [])) if (b.type === 'cut') cuts++;
+    }
+    for (const fStrokes of Object.values(data.strokes || {})) {
+      for (const layerStrokes of Object.values(fStrokes || {})) {
+        for (const arr of Object.values(layerStrokes || {})) strokes += (arr?.length || 0);
+      }
+    }
+    for (const arr of Object.values(data.bubblesByLayer || {})) bubbles += (arr?.length || 0);
+    return { frames: (data.frames || []).length, cuts, strokes, bubbles };
+  }, []);
+
+  // 페이로드를 받아서 모든 state / ref 를 갈아끼운다. bitmap 재생성은 useEffect 에서 처리한다.
+  const deserializeProject = useCallback((data) => {
+    const v = validatePayload(data);
+    if (!v.ok) return v;
+
+    // 1) ID 카운터를 끌어올려서 신규 ID 가 기존과 충돌하지 않게 한다
+    bumpIdTo(findMaxIdInPayload(data));
+
+    // 2) strokes ref 를 새 데이터로 교체 (기존 bitmaps / history 는 버린다)
+    const newStore = {};
+    for (const fid of Object.keys(data.strokes || {})) {
+      const layerMap = data.strokes[fid] || {};
+      const numericFid = Number(fid);
+      newStore[numericFid] = {};
+      for (const lid of Object.keys(layerMap)) {
+        const blocksOut = {};
+        for (const bid of Object.keys(layerMap[lid] || {})) {
+          const arr = layerMap[lid][bid] || [];
+          blocksOut[bid] = arr.map(s => {
+            const pts = (s.points || []).map(p => ({ x: p.x, y: p.y }));
+            return {
+              points: pts,
+              size: s.size,
+              opacity: s.opacity,
+              color: s.color || '#0F0F0F',
+              bbox: computeBbox(pts.length ? pts : [{ x: 0, y: 0 }]),
+              hidden: false,
+            };
+          });
+        }
+        const numericLid = Number(lid);
+        newStore[numericFid][numericLid] = { byBlock: blocksOut, bitmaps: {}, history: [] };
+      }
+    }
+    strokesByFrameRef.current = newStore;
+
+    // 3) bubble layer key 를 numeric 으로 정규화
+    const newBubbles = {};
+    for (const lid of Object.keys(data.bubblesByLayer || {})) {
+      newBubbles[Number(lid)] = (data.bubblesByLayer[lid] || []).map(b => ({ ...b }));
+    }
+
+    // 4) lasso / drawing 상태 초기화
+    lassoRef.current = {
+      phase: 'idle', frameId: null, layerId: null,
+      lassoPoints: [], selectedItems: [], bbox: null,
+      transform: { tx: 0, ty: 0, scaleX: 1, scaleY: 1, angle: 0, flipH: false, flipV: false },
+      dragStart: null, origTransform: null, dragHandle: null, origHandleDist: null,
+    };
+    drawingRef.current = null;
+    currentStrokeRef.current = null;
+    setHasSelection(false);
+    setSelectionPhase('idle');
+    setSelectedBubble(null);
+
+    // 5) 새 frame 의 getLayerBitmap 클로저를 미리 등록
+    getLayerBitmapRef.current = {};
+    for (const f of (data.frames || [])) {
+      const fid = f.id;
+      getLayerBitmapRef.current[fid] = (layerId, blockId) => {
+        const fStore = strokesByFrameRef.current[fid];
+        return fStore?.[layerId]?.bitmaps[blockId] || null;
+      };
+    }
+
+    // 6) state 갈아끼우기
+    const newFrames = data.frames.map(f => ({
+      ...f,
+      blocks: (f.blocks || []).map(b => ({ ...b })),
+      layers: (f.layers || []).map(l => ({ ...l })),
+    }));
+    const targetFrameId = (newFrames.find(f => f.id === data.selectedFrameId) ? data.selectedFrameId : newFrames[0].id);
+    setFrames(newFrames);
+    setSelectedFrameId(targetFrameId);
+    setBubblesByLayer(newBubbles);
+    if (Array.isArray(data.typoPresets) && data.typoPresets.length > 0) {
+      setTypoPresets(data.typoPresets.map(p => ({ ...p })));
+    }
+
+    // 7) bitmap rebuild 트리거 — useEffect 가 새 frames 와 함께 처리한다
+    autosaveLockRef.current = true; // load 직후 autosave 가 다시 실행되지 않게 잠금 (잠깐)
+    setLoadGen(g => g + 1);
+
+    return { ok: true };
+  }, []);
+
+  // load 직후 모든 frame / layer / block 의 bitmap 을 다시 만든다.
+  useEffect(() => {
+    if (loadGen === 0) return;
+    // setFrames 가 반영된 시점이라 frames 가 새 데이터 — 그걸 기준으로 rebuild
+    for (const f of frames) {
+      for (const layer of f.layers) {
+        if (layer.type !== 'raster') continue;
+        ensureLayerStore(f.id, layer.id);
+        for (const block of f.blocks) rebuildBlockBitmap(f.id, layer.id, block, f.canvasWidth);
+      }
+    }
+    // 다음 tick 에 redraw — canvas useLayoutEffect 가 먼저 사이즈 잡고 실행되도록
+    const t = setTimeout(() => {
+      for (const f of frames) frameRefs.current[f.id]?.redraw();
+      // load 잠금 해제
+      autosaveLockRef.current = false;
+    }, 30);
+    return () => clearTimeout(t);
+  }, [loadGen, frames, ensureLayerStore, rebuildBlockBitmap]);
+
+  // 자동 저장 트리거 (디바운스)
+  const requestAutosave = useCallback(() => {
+    if (autosaveLockRef.current) return;
+    setSaveStatus('dirty');
+    if (autosaveTimerRef.current) clearTimeout(autosaveTimerRef.current);
+    autosaveTimerRef.current = setTimeout(async () => {
+      if (autosaveLockRef.current) return;
+      setSaveStatus('saving');
+      try {
+        const data = serializeProject();
+        const meta = computeProjectMeta(data);
+        const r = await ProjectStorage.setAutosave({
+          name: currentProjectName || '자동 저장본',
+          savedAt: Date.now(),
+          appVersion: APP_VERSION,
+          schemaVersion: SCHEMA_VERSION,
+          meta,
+          payload: data,
+          // 현재 명시적으로 저장된 프로젝트와 연결되어 있으면 같이 기록 (load 시 컨텍스트 유지)
+          linkedProjectId: currentProjectId || null,
+        });
+        if (r?.ok) {
+          if (r.backend) setStorageBackend(r.backend);
+          setSaveStatus('saved');
+          setLastSaveAt(Date.now());
+          if (savedFlashTimerRef.current) clearTimeout(savedFlashTimerRef.current);
+          savedFlashTimerRef.current = setTimeout(() => setSaveStatus('idle'), 2500);
+        } else {
+          setSaveStatus('error');
+        }
+      } catch (_) { setSaveStatus('error'); }
+    }, 1500);
+  }, [serializeProject, computeProjectMeta, currentProjectName, currentProjectId]);
+
+  // useCallback hooks 등에서 stale closure 없이 호출할 수 있게 ref 동기화
+  useEffect(() => { requestAutosaveRef.current = requestAutosave; }, [requestAutosave]);
+
+  // React state 가 바뀌면 자동 저장 요청 (frames / bubbles / typo)
+  useEffect(() => {
+    if (autosaveLockRef.current) return;
+    requestAutosave();
+  }, [frames, bubblesByLayer, typoPresets, requestAutosave]);
+
+  // 마운트 시 자동 저장본을 1회 검사해서 복원 여부를 묻는다
+  useEffect(() => {
+    if (autosaveCheckedRef.current) return;
+    autosaveCheckedRef.current = true;
+    let cancelled = false;
+    let restoredViaDeserialize = false;
+    (async () => {
+      try {
+        const auto = await ProjectStorage.getAutosave();
+        if (cancelled || !auto?.payload) return;
+        // 비어있는 (frame 1개, stroke 0, bubble 0) 자동저장은 무시
+        const meta = auto.meta || {};
+        const isEmpty = (meta.frames ?? 0) <= 1 && (meta.strokes ?? 0) === 0 && (meta.bubbles ?? 0) === 0;
+        if (isEmpty) return;
+        const when = formatRelativeTime(auto.savedAt);
+        const summary = `자동 저장된 작업이 있습니다.\n\n` +
+          `${auto.name || '자동 저장본'}\n저장: ${when}\n` +
+          `frames ${meta.frames ?? '?'} · cuts ${meta.cuts ?? '?'} · ` +
+          `strokes ${meta.strokes ?? '?'} · bubbles ${meta.bubbles ?? '?'}\n\n` +
+          `이전 작업으로 복원하시겠습니까?`;
+        if (window.confirm(summary)) {
+          const r = deserializeProject(auto.payload);
+          if (r.ok) {
+            restoredViaDeserialize = true; // deserializeProject 가 자체적으로 lock 을 관리함
+            // 자동저장이 저장된 프로젝트와 연결되어 있으면 컨텍스트 복원
+            if (auto.linkedProjectId) {
+              const linked = await ProjectStorage.getProject(auto.linkedProjectId);
+              if (linked) {
+                setCurrentProjectId(auto.linkedProjectId);
+                setCurrentProjectName(linked.name || auto.name || '');
+              } else {
+                setCurrentProjectName(auto.name || '');
+              }
+            } else {
+              setCurrentProjectName(auto.name || '');
+            }
+            setLastSaveAt(auto.savedAt || 0);
+          }
+        }
+      } catch (_) {}
+      finally {
+        // deserializeProject 가 lock 을 관리하지 않은 경우 여기서 풀어준다
+        if (!cancelled && !restoredViaDeserialize) {
+          autosaveLockRef.current = false;
+        }
+      }
+    })();
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // ===== 명시적 저장 / 불러오기 =====
+
+  const handleSaveAsNewProject = useCallback(async (name) => {
+    setSaveStatus('saving');
+    const data = serializeProject();
+    const meta = computeProjectMeta(data);
+    const id = `proj_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    const record = {
+      id,
+      name,
+      savedAt: Date.now(),
+      appVersion: APP_VERSION,
+      schemaVersion: SCHEMA_VERSION,
+      meta,
+      payload: data,
+    };
+    const r = await ProjectStorage.saveProject(record);
+    if (r.ok) {
+      if (r.backend) setStorageBackend(r.backend);
+      setCurrentProjectId(id);
+      setCurrentProjectName(name);
+      setSaveStatus('saved');
+      setLastSaveAt(Date.now());
+      if (savedFlashTimerRef.current) clearTimeout(savedFlashTimerRef.current);
+      savedFlashTimerRef.current = setTimeout(() => setSaveStatus('idle'), 2500);
+    } else {
+      setSaveStatus('error');
+    }
+    return r;
+  }, [serializeProject, computeProjectMeta]);
+
+  const handleSaveCurrentProject = useCallback(async () => {
+    if (!currentProjectId) {
+      // 새 이름으로 저장
+      const name = window.prompt('프로젝트 이름을 입력해주세요', currentProjectName || `프로젝트 ${new Date().toLocaleString('ko-KR')}`);
+      if (!name?.trim()) return { ok: false, error: '이름이 비어있습니다' };
+      return handleSaveAsNewProject(name.trim());
+    }
+    setSaveStatus('saving');
+    const data = serializeProject();
+    const meta = computeProjectMeta(data);
+    const record = {
+      id: currentProjectId,
+      name: currentProjectName,
+      savedAt: Date.now(),
+      appVersion: APP_VERSION,
+      schemaVersion: SCHEMA_VERSION,
+      meta,
+      payload: data,
+    };
+    const r = await ProjectStorage.saveProject(record);
+    if (r.ok) {
+      if (r.backend) setStorageBackend(r.backend);
+      setSaveStatus('saved');
+      setLastSaveAt(Date.now());
+      if (savedFlashTimerRef.current) clearTimeout(savedFlashTimerRef.current);
+      savedFlashTimerRef.current = setTimeout(() => setSaveStatus('idle'), 2500);
+    } else {
+      setSaveStatus('error');
+    }
+    return r;
+  }, [currentProjectId, currentProjectName, serializeProject, computeProjectMeta, handleSaveAsNewProject]);
+
+  const handleLoadProject = useCallback(async (id) => {
+    const rec = await ProjectStorage.getProject(id);
+    if (!rec?.payload) return { ok: false, error: '프로젝트를 찾을 수 없습니다' };
+    const r = deserializeProject(rec.payload);
+    if (r.ok) {
+      setCurrentProjectId(id);
+      setCurrentProjectName(rec.name || '');
+      setLastSaveAt(rec.savedAt || 0);
+      setSaveStatus('idle');
+    }
+    return r;
+  }, [deserializeProject]);
+
+  const handleDeleteProject = useCallback(async (id) => {
+    await ProjectStorage.deleteProject(id);
+    if (currentProjectId === id) { setCurrentProjectId(null); /* 이름은 유지 */ }
+  }, [currentProjectId]);
+
+  const handleRenameProject = useCallback(async (id, newName) => {
+    const rec = await ProjectStorage.getProject(id);
+    if (!rec) return;
+    rec.name = newName;
+    await ProjectStorage.saveProject(rec);
+    if (currentProjectId === id) setCurrentProjectName(newName);
+  }, [currentProjectId]);
+
+  // 모든 강제 상태를 새것으로 리셋
+  const handleNewProject = useCallback(async () => {
+    autosaveLockRef.current = true;
+    // strokes, lasso, drawing 정리
+    strokesByFrameRef.current = {};
+    getLayerBitmapRef.current = {};
+    lassoRef.current = {
+      phase: 'idle', frameId: null, layerId: null,
+      lassoPoints: [], selectedItems: [], bbox: null,
+      transform: { tx: 0, ty: 0, scaleX: 1, scaleY: 1, angle: 0, flipH: false, flipV: false },
+      dragStart: null, origTransform: null, dragHandle: null, origHandleDist: null,
+    };
+    drawingRef.current = null;
+    currentStrokeRef.current = null;
+    clipboardRef.current = null;
+    setHasSelection(false); setHasClipboard(false); setSelectionPhase('idle'); setSelectedBubble(null);
+
+    const fresh = makeStarterFrame('Frame 1');
+    setFrames([fresh]);
+    setSelectedFrameId(fresh.id);
+    setBubblesByLayer({});
+    setTypoPresets(DEFAULT_TYPO_PRESETS);
+    setCurrentProjectId(null);
+    setCurrentProjectName('');
+    setLastSaveAt(0);
+    setSaveStatus('idle');
+
+    // 자동 저장본도 리셋
+    await ProjectStorage.clearAutosave();
+
+    // 새 frame 의 bitmap 셋업을 위해 loadGen 트리거
+    setLoadGen(g => g + 1);
+    return { ok: true };
+  }, []);
+
+  // JSON 파일로 내보내기
+  const handleExport = useCallback(() => {
+    try {
+      const data = serializeProject();
+      const meta = computeProjectMeta(data);
+      const record = {
+        id: currentProjectId || `export_${Date.now()}`,
+        name: currentProjectName || '제목 없음',
+        savedAt: Date.now(),
+        appVersion: APP_VERSION,
+        schemaVersion: SCHEMA_VERSION,
+        meta,
+        payload: data,
+      };
+      const safeName = (record.name || 'project').replace(/[^\w가-힣\-_. ]+/g, '_').slice(0, 60);
+      const ts = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-');
+      const filename = `${safeName}_${ts}.conti.json`;
+      const ok = triggerDownload(filename, JSON.stringify(record));
+      return ok ? { ok: true } : { ok: false, error: '다운로드 실패' };
+    } catch (e) { return { ok: false, error: e?.message || '내보내기 실패' }; }
+  }, [serializeProject, computeProjectMeta, currentProjectId, currentProjectName]);
+
+  // JSON 파일에서 불러오기
+  const handleImportFile = useCallback(async (file) => {
+    try {
+      const text = await readFileAsText(file);
+      let parsed;
+      try { parsed = JSON.parse(text); }
+      catch (_) { return { ok: false, error: 'JSON 파싱 실패 — 올바른 .conti.json 파일이 맞는지 확인해주세요' }; }
+      const data = parsed?.payload || parsed?.data || parsed;
+      const r = deserializeProject(data);
+      if (r.ok) {
+        setCurrentProjectId(null); // 가져온 파일은 아직 IDB 에 저장되지 않은 상태로 본다
+        setCurrentProjectName(parsed.name || file.name.replace(/\.(conti\.)?json$/i, ''));
+        setLastSaveAt(0);
+        setSaveStatus('idle');
+      }
+      return r;
+    } catch (e) { return { ok: false, error: e?.message || '가져오기 실패' }; }
+  }, [deserializeProject]);
+
 
   // ---------- derived ----------
   const previewSize = Math.max(2, Math.min(34, penSize));
@@ -2669,8 +4047,25 @@ export default function ContiProgram() {
         <div className="conti-brand">
           <div className="conti-brand-mark" />
           <div>
-            <div className="conti-brand-name">콘티 프로그램</div>
-            <div className="conti-brand-version">conti.v16</div>
+            <div className="conti-brand-name">{currentProjectName || '콘티 프로그램'}</div>
+            <div className="conti-brand-version">
+              {APP_VERSION}
+              {saveStatus !== 'idle' && (
+                <>
+                  {' · '}
+                  <span className={`conti-save-status ${saveStatus}`}>
+                    <span className="save-dot" />
+                    {saveStatus === 'saving' && '저장중'}
+                    {saveStatus === 'saved' && '저장됨'}
+                    {saveStatus === 'error' && '저장 실패'}
+                    {saveStatus === 'dirty' && '미저장'}
+                  </span>
+                </>
+              )}
+              {saveStatus === 'idle' && lastSaveAt > 0 && (
+                <>{' · '}<span style={{ color: 'var(--muted)' }}>{formatRelativeTime(lastSaveAt)} 저장</span></>
+              )}
+            </div>
           </div>
         </div>
 
@@ -2679,6 +4074,7 @@ export default function ContiProgram() {
           <div className="conti-tool">
             <button className={`conti-icon-btn ${activeTool === 'pen' ? 'active' : ''}`} onClick={() => switchTool('pen')}>✏ pen</button>
             <button className={`conti-icon-btn ${activeTool === 'lasso' ? 'active' : ''}`} onClick={() => switchTool('lasso')}>⬡ lasso</button>
+            <button className={`conti-icon-btn ${activeTool === 'eraser' ? 'active' : ''}`} onClick={() => switchTool('eraser')}>◻ eraser</button>
           </div>
         )}
         <div className="conti-tool-sep" />
@@ -2726,6 +4122,18 @@ export default function ContiProgram() {
           </>
         )}
 
+        {/* Eraser options */}
+        {activeLayerType === 'raster' && activeTool === 'eraser' && (
+          <div className="conti-tool">
+            <span className="conti-tool-label">size</span>
+            <input type="range" min="4" max="200" step="1" value={eraserSize}
+              onChange={e => setEraserSize(parseInt(e.target.value, 10))} />
+            <input className="conti-num" type="number" min="4" max="200" step="1" value={eraserSize}
+              onChange={e => { const v = parseInt(e.target.value, 10); if (Number.isFinite(v)) setEraserSize(Math.max(4, Math.min(200, v))); }} />
+            <span className="conti-tool-unit">px</span>
+          </div>
+        )}
+
         {/* Bubble type selector (vector layer active) */}
         {activeLayerType === 'vector' && (
           <div className="conti-bubble-bar">
@@ -2770,6 +4178,8 @@ export default function ContiProgram() {
             <button className="conti-icon-btn" onClick={undo}
               disabled={!selectedFrame || lassoRef.current.phase !== 'idle'}>↶ undo</button>
           )}
+          <button className="conti-icon-btn" onClick={() => setSaveDialogOpen(true)}
+            title="프로젝트 저장 / 불러오기">📁 project</button>
           <button className="conti-icon-btn danger" onClick={clearAll} disabled={!selectedFrame}>clear all</button>
         </div>
       </header>
@@ -2919,6 +4329,8 @@ export default function ContiProgram() {
                 selectedBubble={selectedBubble}
                 activeLayerType={f.id === selectedFrameId ? activeLayerType : 'raster'}
                 typoPresets={typoPresets}
+                eraserSize={eraserSize}
+                eraserCursor={f.id === selectedFrameId ? eraserCursor : null}
                 onSelect={setSelectedFrameId}
                 onPointerDown={handlePointerDown}
                 onPointerMove={handlePointerMove}
@@ -2932,10 +4344,10 @@ export default function ContiProgram() {
 
           {selectedFrame && (
             <div className="conti-status">
-              <span className={`dot ${activeLayerType === 'vector' ? 'vector' : activeTool === 'lasso' ? 'lasso' : ''}`} />
+              <span className={`dot ${activeLayerType === 'vector' ? 'vector' : activeTool === 'lasso' ? 'lasso' : activeTool === 'eraser' ? 'lasso' : ''}`} />
               <span>{selectedFrame.name}</span>
               <span>·</span>
-              <span>{activeLayerType === 'vector' ? `🗨 ${activeLayer?.name}` : activeTool === 'lasso' ? (hasSelection ? '🟥 selected' : 'lasso') : 'pen'}</span>
+              <span>{activeLayerType === 'vector' ? `🗨 ${activeLayer?.name}` : activeTool === 'lasso' ? (hasSelection ? '🟥 selected' : 'lasso') : activeTool === 'eraser' ? 'eraser' : 'pen'}</span>
               <span>·</span>
               <span>w {selectedFrame.canvasWidth}px</span>
               <span>·</span>
@@ -3022,6 +4434,12 @@ export default function ContiProgram() {
                         </span>
                         <input type="number" min="50" max="5000" step="50" value={b.height}
                           onChange={e => updateBlockHeight(b.id, e.target.value)} />
+                        <div className="block-height-stepper">
+                          <button className="block-height-btn" title="+50px"
+                            onClick={() => updateBlockHeight(b.id, String(b.height + 50))}>▲</button>
+                          <button className="block-height-btn" title="-50px"
+                            onClick={() => updateBlockHeight(b.id, String(b.height - 50))}>▼</button>
+                        </div>
                         <span className="conti-tool-unit mono">px</span>
                         <button className="del" onClick={() => removeBlock(b.id)} title="삭제">×</button>
                       </div>
@@ -3096,6 +4514,22 @@ export default function ContiProgram() {
           </div>
         </aside>
       </div>
+
+      <SaveLoadDialog
+        open={saveDialogOpen}
+        onClose={() => setSaveDialogOpen(false)}
+        currentProjectId={currentProjectId}
+        currentProjectName={currentProjectName}
+        onSaveCurrent={handleSaveCurrentProject}
+        onSaveAsNew={handleSaveAsNewProject}
+        onLoad={handleLoadProject}
+        onDelete={handleDeleteProject}
+        onRename={handleRenameProject}
+        onNewProject={handleNewProject}
+        onExport={handleExport}
+        onImportFile={handleImportFile}
+        storageBackend={storageBackend}
+      />
     </div>
   );
 }
