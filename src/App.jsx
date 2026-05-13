@@ -156,11 +156,45 @@ const hexToRgba = (hex, opacity) => {
 };
 
 // ===================================================================
+//  NUMBER INPUT WITH DRAFT — controlled input that allows intermediate
+//  typing states (e.g. "3" while typing "300") without clamping mid-input.
+//  onCommit(stringValue) is called onBlur or on Enter key.
+// ===================================================================
+const NumberInputWithDraft = ({ value, min, max, step, onCommit, className, style }) => {
+  const [draft, setDraft] = useState(String(value));
+  const focusedRef = useRef(false);
+
+  // Sync from parent only when not focused (e.g. stepper buttons changed value externally)
+  useEffect(() => {
+    if (!focusedRef.current) setDraft(String(value));
+  }, [value]);
+
+  const commit = (raw) => {
+    onCommit(raw);
+    // After commit, reflect the parent's clamped value on next render via useEffect
+  };
+
+  return (
+    <input
+      type="number"
+      min={min} max={max} step={step}
+      className={className}
+      style={style}
+      value={draft}
+      onChange={e => setDraft(e.target.value)}
+      onFocus={() => { focusedRef.current = true; }}
+      onBlur={e => { focusedRef.current = false; commit(e.target.value); }}
+      onKeyDown={e => { if (e.key === 'Enter') { e.currentTarget.blur(); } }}
+    />
+  );
+};
+
+// ===================================================================
 //  PROJECT STORAGE — IndexedDB primary, localStorage fallback
 //  (iPad Safari, desktop browsers, WKWebView App Store apps 모두 호환)
 // ===================================================================
 const SCHEMA_VERSION = 1;
-const APP_VERSION = 'conti.v19';
+const APP_VERSION = 'conti.v26';
 const DB_NAME = 'conti_program_db';
 const DB_STORE = 'projects';
 const AUTOSAVE_ID = '__autosave__';
@@ -557,6 +591,311 @@ const hitTestTailHandle = (bubble, px, py) => {
   return dx * dx + dy * dy <= (TAIL_HANDLE_R + 5) ** 2;
 };
 
+// ===================================================================
+//  PSD EXPORT (.clip 대신 클립스튜디오 호환 PSD/PSB로 내보내기)
+//
+//  왜 .clip 이 아니라 PSD 인가:
+//   .clip 는 Celsys 의 비공개 컨테이너로, 내부적으로
+//     CSFCHUNK → CHNKHead → CHNKExta… → CHNKSQLi (SQLite) → CHNKFoot
+//   구조이며, 실제 픽셀 데이터는 SQLite 안의 Offscreen.BlockData 컬럼에
+//   Celsys 자체 블록 압축 포맷으로 들어간다. 공개 스펙이 없어
+//   브라우저(JS)에서 쓸 수 있는 .clip writer 라이브러리가 존재하지 않는다.
+//
+//   PSD 는 CSP 가 공식적으로 지원하는 1급 교환 포맷이고
+//   File → Open → .psd 하면 레이어/이름/투명도/가시성이 그대로 보존된다.
+//   (CSP 가 PSD 를 export 할 때도 말풍선/텍스트는 어차피 래스터화되므로
+//    이번 워크플로우(콘티 러프 → CSP 본작업)에서 손실은 사실상 없다.)
+//
+//  높이가 30,000px 를 넘으면 자동으로 PSB(Large Document) 로 저장한다.
+// ===================================================================
+
+// 라이브러리(ag-psd, fflate) 를 동적 import 로 가져온다.
+// 번들러 환경이라면 `import { writePsd } from 'ag-psd'` 으로 바꿔도 된다.
+let __agPsdPromise = null;
+const loadAgPsd = () => {
+  if (!__agPsdPromise) {
+    __agPsdPromise = import(/* @vite-ignore */ 'https://esm.sh/ag-psd@25.0.0?bundle')
+      .catch(() => import(/* @vite-ignore */ 'https://cdn.jsdelivr.net/npm/ag-psd@25.0.0/+esm'));
+  }
+  return __agPsdPromise;
+};
+let __fflatePromise = null;
+const loadFflate = () => {
+  if (!__fflatePromise) {
+    __fflatePromise = import(/* @vite-ignore */ 'https://esm.sh/fflate@0.8.2')
+      .catch(() => import(/* @vite-ignore */ 'https://cdn.jsdelivr.net/npm/fflate@0.8.2/+esm'));
+  }
+  return __fflatePromise;
+};
+
+// 안전한 파일명 만들기
+const sanitizeFilename = (s, fallback = 'frame') => {
+  const t = String(s || '').replace(/[^\w가-힣\-_. ]+/g, '_').trim().slice(0, 60);
+  return t || fallback;
+};
+
+// 깨끗한 흰색 캔버스 만들기 (배경 레이어용)
+const makeWhiteCanvas = (w, h) => {
+  const c = document.createElement('canvas');
+  c.width = Math.max(1, w | 0); c.height = Math.max(1, h | 0);
+  const ctx = c.getContext('2d');
+  ctx.fillStyle = '#ffffff';
+  ctx.fillRect(0, 0, c.width, c.height);
+  return c;
+};
+
+// 빈 (투명) 캔버스
+const makeBlankCanvas = (w, h) => {
+  const c = document.createElement('canvas');
+  c.width = Math.max(1, w | 0); c.height = Math.max(1, h | 0);
+  return c;
+};
+
+// strokesByFrameRef 의 한 레이어를 캔버스에 합성
+// (FrameView.redraw 와 동일한 로직, 단 BITMAP_Y_PADDING 보정 포함)
+const composeRasterLayerCanvas = (frame, layerStore, canvasW, canvasH) => {
+  const c = makeBlankCanvas(canvasW, canvasH);
+  const ctx = c.getContext('2d');
+  ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+  let y = 0;
+  for (const b of frame.blocks) {
+    const arr = (layerStore?.byBlock?.[b.id]) || [];
+    // cut 인 경우만 그림, gap 영역은 비워둔다 (콘티는 cut 안에만 그림)
+    if (b.type === 'cut' && arr.length > 0) {
+      // block-local 좌표계는 (0..bw, -BITMAP_Y_PADDING..h+padding) 였으므로
+      // 캔버스 좌표(0..canvasW, y..y+h) 로 옮기려면 y 만큼 평행이동
+      ctx.save();
+      ctx.translate(0, y);
+      for (const s of arr) {
+        if (s.hidden) continue;
+        renderStrokeToCtx(ctx, s, 0); // yShift=0 (이미 translate 했으니까)
+      }
+      ctx.restore();
+    }
+    y += b.height;
+  }
+  return c;
+};
+
+// 한 벡터(말풍선) 레이어를 SVG 로 직렬화한 뒤 캔버스로 래스터화한다.
+// BubbleSVG 와 동일한 path 헬퍼(getRoundedRectPath / getThoughtBubblePath /
+// getShoutBubblePath / getBubbleEdgePoint) 를 그대로 사용한다.
+const composeBubbleLayerCanvas = async (bubbles, typoPresets, canvasW, canvasH) => {
+  const c = makeBlankCanvas(canvasW, canvasH);
+  if (!Array.isArray(bubbles) || bubbles.length === 0) return c;
+  const ctx = c.getContext('2d');
+
+  // SVG 한 덩어리로 빌드
+  const svgParts = [];
+  svgParts.push(`<svg xmlns="http://www.w3.org/2000/svg" width="${canvasW}" height="${canvasH}" viewBox="0 0 ${canvasW} ${canvasH}">`);
+  // 폰트 fallback: Pretendard 가 CSP 에 없을 수 있으니 sans-serif 까지 명시
+  svgParts.push(`<style>text,div{font-family:Pretendard,'Apple SD Gothic Neo','Noto Sans KR',sans-serif;}</style>`);
+
+  for (const b of bubbles) {
+    const { type, x, y, w, h, tailTip, text, typoPresetId } = b;
+    const cx = x + w / 2, cy = y + h / 2, rx = w / 2, ry = h / 2;
+    const preset = typoPresets?.find(p => p.id === typoPresetId);
+    const fontSize = preset ? preset.size : (type === 'shout' ? 18 : 14);
+    const fontWeight = preset ? preset.weight : (type === 'shout' ? 700 : 500);
+
+    // tail
+    if (tailTip) {
+      if (type === 'thought') {
+        const dots = 3;
+        for (let i = 0; i < dots; i++) {
+          const t = (i + 1) / (dots + 1);
+          const ex = cx + (tailTip.x - cx) * t;
+          const ey = (y + h) + (tailTip.y - (y + h)) * t;
+          const r = Math.max(1.5, 5 - i * 1.2);
+          svgParts.push(`<circle cx="${ex}" cy="${ey}" r="${r}" fill="#fff" stroke="#1a1a1a" stroke-width="2"/>`);
+        }
+      } else {
+        const ep = getBubbleEdgePoint(b, tailTip.x, tailTip.y);
+        const tdx = ep.x - tailTip.x, tdy = ep.y - tailTip.y;
+        const tlen = Math.sqrt(tdx * tdx + tdy * tdy) || 1;
+        const hw = type === 'shout' ? 14 : 11;
+        const perp = { x: -tdy / tlen, y: tdx / tlen };
+        const pts = `${ep.x + perp.x * hw},${ep.y + perp.y * hw} ${ep.x - perp.x * hw},${ep.y - perp.y * hw} ${tailTip.x},${tailTip.y}`;
+        const dash = type === 'whisper' ? ` stroke-dasharray="5,3"` : '';
+        svgParts.push(`<polygon points="${pts}" fill="#fff" stroke="#1a1a1a" stroke-width="2.5"${dash}/>`);
+      }
+    }
+
+    // shape
+    if (type === 'normal' || type === 'whisper') {
+      const d = getRoundedRectPath(x, y, w, h, 108);
+      const dash = type === 'whisper' ? ` stroke-dasharray="7,4"` : '';
+      svgParts.push(`<path d="${d}" fill="#fff" stroke="#1a1a1a" stroke-width="2.5"${dash}/>`);
+    } else if (type === 'thought') {
+      const d = getThoughtBubblePath(cx, cy, rx, ry);
+      svgParts.push(`<path d="${d}" fill="#fff" stroke="#1a1a1a" stroke-width="2.5"/>`);
+    } else if (type === 'shout') {
+      const d = getShoutBubblePath(cx, cy, rx, ry);
+      svgParts.push(`<path d="${d}" fill="#fff" stroke="#1a1a1a" stroke-width="3.5" stroke-linejoin="miter"/>`);
+    }
+
+    // text (foreignObject 로 BubbleSVG 의 flex 중앙정렬 그대로 재현)
+    const tpx = type === 'shout' ? w * 0.22 : type === 'thought' ? w * 0.1 : 12;
+    const tpy = type === 'shout' ? h * 0.22 : type === 'thought' ? h * 0.1 : 8;
+    const safeText = String(text || '')
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+      .replace(/\n/g, '<br/>');
+    svgParts.push(
+      `<foreignObject x="${x}" y="${y}" width="${Math.max(1, w)}" height="${Math.max(1, h)}">` +
+      `<div xmlns="http://www.w3.org/1999/xhtml" style="width:100%;height:100%;display:flex;align-items:center;justify-content:center;padding:${tpy}px ${tpx}px;box-sizing:border-box;">` +
+      `<div style="font-size:${fontSize}px;font-weight:${fontWeight};color:#1a1a1a;word-break:break-word;text-align:center;line-height:1.4;white-space:pre-wrap;width:100%;">${safeText}</div>` +
+      `</div></foreignObject>`
+    );
+  }
+  svgParts.push('</svg>');
+
+  const svgBlob = new Blob([svgParts.join('')], { type: 'image/svg+xml;charset=utf-8' });
+  const url = URL.createObjectURL(svgBlob);
+  try {
+    await new Promise((resolve, reject) => {
+      const img = new Image();
+      img.onload = () => { ctx.drawImage(img, 0, 0); resolve(); };
+      img.onerror = (e) => reject(e || new Error('SVG 래스터화 실패'));
+      img.src = url;
+    });
+  } finally {
+    URL.revokeObjectURL(url);
+  }
+  return c;
+};
+
+// 컷 경계 + 양옆 마진을 표시하는 가이드 캔버스 (CSP 에서 본작업할 때 위치 잡기용)
+const composeGuidesCanvas = (frame, canvasW, canvasH) => {
+  const c = makeBlankCanvas(canvasW, canvasH);
+  const ctx = c.getContext('2d');
+  ctx.lineWidth = 1;
+  // 컷 경계 (빨간 실선) / 갭 경계 (옅은 파선)
+  let y = 0;
+  for (const b of frame.blocks) {
+    if (b.type === 'cut') {
+      const ml = b.marginLeft ?? frame.sideMargin;
+      const mr = b.marginRight ?? frame.sideMargin;
+      // 컷 박스 외곽 (#d63a2e 옅은 빨강)
+      ctx.strokeStyle = 'rgba(214, 58, 46, 0.55)';
+      ctx.setLineDash([]);
+      ctx.strokeRect(ml + 0.5, y + 0.5, Math.max(0, canvasW - ml - mr) - 1, b.height - 1);
+    } else {
+      // gap 영역은 가운데를 가로지르는 점선
+      ctx.strokeStyle = 'rgba(214, 58, 46, 0.35)';
+      ctx.setLineDash([6, 4]);
+      ctx.beginPath();
+      ctx.moveTo(0, y + b.height / 2 + 0.5);
+      ctx.lineTo(canvasW, y + b.height / 2 + 0.5);
+      ctx.stroke();
+      ctx.setLineDash([]);
+    }
+    y += b.height;
+  }
+  // 양옆 sideMargin 보조선 (옅은 회색 파선)
+  ctx.strokeStyle = 'rgba(80, 80, 80, 0.4)';
+  ctx.setLineDash([4, 4]);
+  ctx.beginPath();
+  ctx.moveTo(frame.sideMargin + 0.5, 0);
+  ctx.lineTo(frame.sideMargin + 0.5, canvasH);
+  ctx.moveTo(canvasW - frame.sideMargin + 0.5, 0);
+  ctx.lineTo(canvasW - frame.sideMargin + 0.5, canvasH);
+  ctx.stroke();
+  return c;
+};
+
+// 한 프레임을 PSD/PSB 바이트 Uint8Array 로 만든다.
+// frame: project frame 객체
+// strokesRef: strokesByFrameRef.current  (전체)
+// bubblesByLayer / typoPresets: 컴포넌트 state
+// 반환: { bytes: Uint8Array, ext: 'psd' | 'psb' }
+const buildFramePsd = async (frame, strokesRef, bubblesByLayer, typoPresets) => {
+  const { writePsd, writePsdBuffer } = await loadAgPsd();
+  const canvasW = Math.max(1, frame.canvasWidth | 0);
+  const canvasH = Math.max(1, frame.blocks.reduce((s, b) => s + b.height, 0) | 0);
+  const usePsb = canvasH > 30000 || canvasW > 30000;
+
+  // 레이어 빌드 (PSD 는 위쪽이 children[0])
+  const conteChildren = [];
+
+  // frame.layers 는 콘티 UI 상의 순서대로다.
+  // PSD layer 순서를 콘티 순서와 맞추기 위해 그대로 push 한다.
+  for (const L of frame.layers) {
+    const opacity = Math.max(0, Math.min(1, (L.opacity ?? 100) / 100));
+    const hidden = !L.visible;
+    if (L.type === 'raster') {
+      const ls = strokesRef?.[frame.id]?.[L.id];
+      const canvas = composeRasterLayerCanvas(frame, ls || { byBlock: {} }, canvasW, canvasH);
+      conteChildren.push({
+        name: L.name || 'Layer',
+        canvas, opacity, hidden,
+        blendMode: 'normal',
+      });
+    } else if (L.type === 'vector') {
+      const bubbles = bubblesByLayer?.[L.id] || [];
+      const canvas = await composeBubbleLayerCanvas(bubbles, typoPresets, canvasW, canvasH);
+      conteChildren.push({
+        name: L.name || 'Bubble',
+        canvas, opacity, hidden,
+        blendMode: 'normal',
+      });
+    }
+  }
+
+  // 가이드 그룹 (CSP 에서 안 보이게 기본 hidden)
+  const guideCanvas = composeGuidesCanvas(frame, canvasW, canvasH);
+  const guideGroup = {
+    name: '[가이드] 컷·마진',
+    opened: false,
+    hidden: true,
+    children: [
+      { name: '컷 경계 + 양옆 마진', canvas: guideCanvas, opacity: 1, hidden: false },
+    ],
+  };
+
+  // 콘티 그룹
+  // 레이어 순서 매핑:
+  //   콘티 UI 는 frame.layers[length-1] 이 가장 위(최상단), layers[0] 이 가장 아래.
+  //   redraw() 는 layers[0] → layers[length-1] 순으로 그리므로 뒤쪽이 위에 덮어씌워진다.
+  //   PSD/ag-psd 의 children 은 children[0] 이 최상단.
+  //   따라서 frame.layers 를 그대로 순회해 push 한 뒤 reverse() 하면
+  //   conteChildren[0] = layers[length-1] (콘티 UI 맨 위) = PSD 최상단. 매핑 OK.
+  const conteGroup = {
+    name: '콘티',
+    opened: true,
+    hidden: false,
+    children: conteChildren.reverse(),
+  };
+
+  // 배경(흰색)
+  const bgCanvas = makeWhiteCanvas(canvasW, canvasH);
+  const bgLayer = {
+    name: 'Background',
+    canvas: bgCanvas, opacity: 1, hidden: false, blendMode: 'normal',
+  };
+
+  const psd = {
+    width: canvasW,
+    height: canvasH,
+    // 합성용 캔버스(섬네일/플랫 미리보기). CSP 는 레이어를 읽으므로 우선순위 낮음.
+    canvas: bgCanvas,
+    children: [guideGroup, conteGroup, bgLayer], // 위 → 아래
+  };
+
+  const writer = writePsdBuffer || writePsd;
+  const bytes = writer(psd, { psb: usePsb });
+  return { bytes: bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes), ext: usePsb ? 'psb' : 'psd' };
+};
+
+// 단일 프레임 다운로드
+const triggerBytesDownload = (filename, bytes, mime = 'application/octet-stream') => {
+  const blob = new Blob([bytes], { type: mime });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = filename; a.style.display = 'none';
+  document.body.appendChild(a); a.click();
+  setTimeout(() => { document.body.removeChild(a); URL.revokeObjectURL(url); }, 100);
+};
+
 // ---------- layer & frame factory ----------
 const makeLayer = (name, type) => ({
   id: newId(), name, type, visible: true, opacity: 100,
@@ -734,6 +1073,8 @@ const SaveLoadDialog = ({
   currentProjectId, currentProjectName,
   onSaveCurrent, onSaveAsNew, onLoad, onDelete, onRename, onNewProject,
   onExport, onImportFile,
+  onExportPSD,
+  hasFrames, frameCount,
   storageBackend,
 }) => {
   const [projects, setProjects] = useState([]);
@@ -826,6 +1167,27 @@ const SaveLoadDialog = ({
     setErrorMsg('');
     const r = onExport();
     if (!r?.ok) setErrorMsg(r?.error || '내보내기 실패');
+  };
+
+  const handleExportPSDCurrent = async () => {
+    if (!onExportPSD) return;
+    setBusy(true); setErrorMsg('');
+    try {
+      const r = await onExportPSD('current');
+      if (!r?.ok) setErrorMsg(r?.error || 'PSD 내보내기 실패');
+    } catch (e) { setErrorMsg(e?.message || 'PSD 내보내기 실패'); }
+    finally { setBusy(false); }
+  };
+
+  const handleExportPSDAll = async () => {
+    if (!onExportPSD) return;
+    if (frameCount > 1 && !window.confirm(`${frameCount}개 프레임을 각각 PSD 로 변환해 zip 으로 받습니다.\n프레임 수에 따라 수십 초 걸릴 수 있어요. 계속할까요?`)) return;
+    setBusy(true); setErrorMsg('');
+    try {
+      const r = await onExportPSD('all');
+      if (!r?.ok) setErrorMsg(r?.error || 'PSD 내보내기 실패');
+    } catch (e) { setErrorMsg(e?.message || 'PSD 내보내기 실패'); }
+    finally { setBusy(false); }
   };
 
   const handleImportClick = () => fileInputRef.current?.click();
@@ -943,6 +1305,35 @@ const SaveLoadDialog = ({
               </button>
               <input ref={fileInputRef} type="file" accept=".json,.conti,.conti.json,application/json"
                 style={{ display: 'none' }} onChange={handleFileChange} />
+            </div>
+          </section>
+
+          {/* CLIP STUDIO 연동 — PSD 내보내기 */}
+          <section className="conti-modal-section">
+            <h4>클립스튜디오로 보내기 <span className="conti-modal-tag">PSD/PSB</span></h4>
+            <div className="conti-modal-hint">
+              .clip 포맷은 Celsys 비공개 포맷이라 직접 만들 수 없어, CSP 가 공식 지원하는 PSD 로 내보냅니다.
+              CSP 에서 <strong>파일 → 열기</strong> 로 그대로 열면 레이어가 보존됩니다.
+              {' '}높이가 30,000px 를 넘는 프레임은 자동으로 PSB(Large Document) 로 저장돼요.
+              {' '}말풍선/텍스트는 래스터화됩니다 (CSP 자체 PSD export 도 동일).
+            </div>
+            <div className="conti-modal-save-row">
+              <button
+                className="conti-modal-btn primary"
+                disabled={busy || !hasFrames}
+                onClick={handleExportPSDCurrent}
+                title="현재 선택된 프레임만 PSD 로 내보냅니다"
+              >
+                🎨 현재 프레임만 PSD 로
+              </button>
+              <button
+                className="conti-modal-btn"
+                disabled={busy || !hasFrames}
+                onClick={handleExportPSDAll}
+                title="모든 프레임을 각각 PSD 로 만들어 zip 으로 다운로드"
+              >
+                📦 모든 프레임 → zip{frameCount > 0 ? ` (${frameCount}개)` : ''}
+              </button>
             </div>
           </section>
 
@@ -1941,6 +2332,7 @@ export default function ContiProgram() {
     lassoPoints: [], selectedItems: [], bbox: null,
     transform: { tx: 0, ty: 0, scaleX: 1, scaleY: 1, angle: 0, flipH: false, flipV: false },
     dragStart: null, origTransform: null, dragHandle: null, origHandleDist: null,
+    transformHistory: [], // 올가미 툴 내부 undo 스택 (rotate/flip/drag/resize)
   });
 
   const clipboardRef = useRef(null);
@@ -2402,6 +2794,7 @@ export default function ContiProgram() {
     lasso.selectedItems = selectedItems;
     lasso.bbox = { minX, minY, maxX, maxY, cx: (minX+maxX)/2, cy: (minY+maxY)/2 };
     lasso.transform = { tx:0, ty:0, scaleX:1, scaleY:1, angle:0, flipH:false, flipV:false };
+    lasso.transformHistory = []; // 새 선택 시 transform 히스토리 초기화
     lasso.phase = 'selected';
 
     for (const blockId of dirtyBlocks) {
@@ -2465,6 +2858,7 @@ export default function ContiProgram() {
       }
     frameRefs.current[frameId]?.redraw();
     lasso.phase = 'idle'; lasso.selectedItems = []; lasso.bbox = null; lasso.frameId = null;
+    lasso.transformHistory = []; // apply 시 transform 히스토리 초기화
     frameRefs.current[frameId]?.clearOverlay();
     setHasSelection(false); setSelectionPhase('idle');
     requestAutosave();
@@ -2489,6 +2883,7 @@ export default function ContiProgram() {
       }
     frameRefs.current[frameId]?.redraw();
     lasso.phase = 'idle'; lasso.selectedItems = []; lasso.bbox = null; lasso.frameId = null;
+    lasso.transformHistory = []; // cancel 시 transform 히스토리 초기화
     frameRefs.current[frameId]?.clearOverlay();
     setHasSelection(false); setSelectionPhase('idle');
   };
@@ -2542,6 +2937,7 @@ export default function ContiProgram() {
   const flipSelection = (axis) => {
     const lasso = lassoRef.current;
     if (!['selected','dragging','resizing','rotating'].includes(lasso.phase)) return;
+    lasso.transformHistory.push({ ...lasso.transform }); // flip 전 snapshot 저장
     lasso.transform = axis === 'h' ? { ...lasso.transform, flipH: !lasso.transform.flipH } : { ...lasso.transform, flipV: !lasso.transform.flipV };
     renderSelectionOverlay(lasso.frameId);
   };
@@ -2549,6 +2945,7 @@ export default function ContiProgram() {
   const rotateSelectionDeg = (deg) => {
     const lasso = lassoRef.current;
     if (!['selected','dragging','resizing','rotating'].includes(lasso.phase)) return;
+    lasso.transformHistory.push({ ...lasso.transform }); // 회전 전 snapshot 저장
     lasso.transform = { ...lasso.transform, angle: lasso.transform.angle + deg * Math.PI / 180 };
     renderSelectionOverlay(lasso.frameId);
   };
@@ -2582,6 +2979,7 @@ export default function ContiProgram() {
       }
     frameRefs.current[frameId]?.redraw();
     lasso.phase = 'idle'; lasso.selectedItems = []; lasso.bbox = null; lasso.frameId = null;
+    lasso.transformHistory = []; // delete 시 transform 히스토리 초기화
     frameRefs.current[frameId]?.clearOverlay();
     setHasSelection(false); setSelectionPhase('idle');
     requestAutosave();
@@ -2732,7 +3130,15 @@ export default function ContiProgram() {
       activeTouchPointersRef.current.delete(e.pointerId);
       if (activeTouchPointersRef.current.size === 1 && twoFingerTapRef.current.active && !twoFingerTapRef.current.moved) {
         twoFingerTapRef.current = { active: false, startMap: null, moved: false };
-        undoLastStroke();
+        // 올가미 내부 transform 히스토리가 있으면 먼저 undo, 없으면 일반 undo
+        const lasso2 = lassoRef.current;
+        if (lasso2.transformHistory && lasso2.transformHistory.length > 0) {
+          const prevTransform = lasso2.transformHistory.pop();
+          lasso2.transform = prevTransform;
+          renderSelectionOverlay(lasso2.frameId);
+        } else {
+          undoLastStroke();
+        }
         panStateRef.current = null;
         return;
       }
@@ -2748,6 +3154,8 @@ export default function ContiProgram() {
     }
     if (['dragging','resizing','rotating'].includes(lasso.phase)) {
       try { overlayEl?.releasePointerCapture(e.pointerId); } catch(_) {}
+      // 드래그/리사이즈/회전 시작 시 저장해둔 origTransform을 히스토리에 기록 (undo 대응)
+      if (lasso.origTransform) lasso.transformHistory.push({ ...lasso.origTransform });
       lasso.phase = 'selected'; setSelectionPhase('selected');
       renderSelectionOverlay(lasso.frameId);
     }
@@ -2776,7 +3184,16 @@ export default function ContiProgram() {
       if ((e.ctrlKey || e.metaKey) && e.key === 'z' && !e.shiftKey) {
         if (!['INPUT', 'TEXTAREA'].includes(tag)) {
           e.preventDefault();
-          undoLastStroke();
+          // 올가미 툴 내부에서 transform 히스토리가 있으면 lasso undo 우선
+          const lassoNow = lassoRef.current;
+          if (['selected','dragging','resizing','rotating'].includes(lassoNow.phase) &&
+              lassoNow.transformHistory && lassoNow.transformHistory.length > 0) {
+            const prevTransform = lassoNow.transformHistory.pop();
+            lassoNow.transform = prevTransform;
+            renderSelectionOverlay(lassoNow.frameId);
+          } else {
+            undoLastStroke();
+          }
           return;
         }
       }
@@ -3556,7 +3973,16 @@ export default function ContiProgram() {
     setTimeout(() => frameRefs.current[selectedFrameId]?.redraw(), 0);
   };
   const undo = () => {
-    if (!selectedFrame || lassoRef.current.phase !== 'idle') return;
+    const lasso = lassoRef.current;
+    // 올가미 내부에서 transform 히스토리가 있으면 lasso undo 우선
+    if (['selected','dragging','resizing','rotating'].includes(lasso.phase) &&
+        lasso.transformHistory && lasso.transformHistory.length > 0) {
+      const prevTransform = lasso.transformHistory.pop();
+      lasso.transform = prevTransform;
+      renderSelectionOverlay(lasso.frameId);
+      return;
+    }
+    if (!selectedFrame || lasso.phase !== 'idle') return;
     const activeLayerId = getActiveRasterLayerId(selectedFrame);
     if (!activeLayerId) return;
     const store = ensureLayerStore(selectedFrameId, activeLayerId);
@@ -3698,6 +4124,7 @@ export default function ContiProgram() {
       lassoPoints: [], selectedItems: [], bbox: null,
       transform: { tx: 0, ty: 0, scaleX: 1, scaleY: 1, angle: 0, flipH: false, flipV: false },
       dragStart: null, origTransform: null, dragHandle: null, origHandleDist: null,
+      transformHistory: [],
     };
     drawingRef.current = null;
     currentStrokeRef.current = null;
@@ -3950,6 +4377,7 @@ export default function ContiProgram() {
       lassoPoints: [], selectedItems: [], bbox: null,
       transform: { tx: 0, ty: 0, scaleX: 1, scaleY: 1, angle: 0, flipH: false, flipV: false },
       dragStart: null, origTransform: null, dragHandle: null, origHandleDist: null,
+      transformHistory: [],
     };
     drawingRef.current = null;
     currentStrokeRef.current = null;
@@ -4014,6 +4442,62 @@ export default function ContiProgram() {
       return r;
     } catch (e) { return { ok: false, error: e?.message || '가져오기 실패' }; }
   }, [deserializeProject]);
+
+  // ---- PSD 내보내기 (클립스튜디오 호환) ----
+  // 클립스튜디오의 .clip 컨테이너는 비공개 포맷(Celsys 자체 BlockData 픽셀 압축)이라
+  // 브라우저에서 직접 만들 수 없다. 대신 CSP 가 1급으로 지원하는 PSD/PSB 로 내보낸다.
+  // - target: 'current' = 현재 선택된 프레임만 / 'all' = 모든 프레임을 zip 으로
+  const handleExportPSD = useCallback(async (target = 'current') => {
+    try {
+      const baseName = sanitizeFilename(currentProjectName || '제목 없음', 'conti');
+
+      if (target === 'current') {
+        if (!selectedFrame) return { ok: false, error: '선택된 프레임이 없습니다' };
+        const { bytes, ext } = await buildFramePsd(
+          selectedFrame, strokesByFrameRef.current, bubblesByLayer, typoPresets
+        );
+        const fname = `${baseName}_${sanitizeFilename(selectedFrame.name, 'frame')}.${ext}`;
+        triggerBytesDownload(fname, bytes);
+        return { ok: true, filename: fname };
+      }
+
+      // all → zip
+      if (!Array.isArray(frames) || frames.length === 0) {
+        return { ok: false, error: '내보낼 프레임이 없습니다' };
+      }
+      const { zipSync, strToU8 } = await loadFflate();
+      const entries = {};
+      // 동시에 빌드하면 메모리/CPU 부담 — 직렬로 처리
+      for (let i = 0; i < frames.length; i++) {
+        const f = frames[i];
+        const { bytes, ext } = await buildFramePsd(
+          f, strokesByFrameRef.current, bubblesByLayer, typoPresets
+        );
+        const idx = String(i + 1).padStart(2, '0');
+        const name = `${idx}_${sanitizeFilename(f.name, `frame_${i + 1}`)}.${ext}`;
+        entries[name] = bytes;
+      }
+      // README 도 같이 넣어준다 — CSP 사용자가 처음 받으면 헷갈릴 수 있어서
+      const readme =
+        `이 zip 은 콘티 프로그램에서 내보낸 PSD 파일 모음입니다.\n\n` +
+        `사용법:\n` +
+        `  1. 각 .psd / .psb 파일을 클립스튜디오에서 [파일 > 열기] 로 엽니다.\n` +
+        `  2. 레이어 / 레이어 이름 / 가시성 / 투명도가 그대로 유지됩니다.\n` +
+        `  3. [가이드] 그룹에는 컷 경계와 양옆 마진이 들어 있습니다 (기본 숨김).\n` +
+        `  4. 말풍선/텍스트는 래스터화되어 있습니다 (CSP 도 PSD export 시 동일 동작).\n\n` +
+        `참고: .clip 포맷은 비공개 포맷이라 직접 만들 수 없어 PSD/PSB 로 내보냅니다.\n` +
+        `CSP 가 공식 권장하는 교환 포맷입니다.\n`;
+      entries['README.txt'] = strToU8(readme);
+
+      const zipped = zipSync(entries, { level: 6 });
+      const fname = `${baseName}_psd.zip`;
+      triggerBytesDownload(fname, zipped, 'application/zip');
+      return { ok: true, filename: fname, count: frames.length };
+    } catch (e) {
+      console.error('[PSD export]', e);
+      return { ok: false, error: e?.message || 'PSD 내보내기 실패' };
+    }
+  }, [selectedFrame, frames, bubblesByLayer, typoPresets, currentProjectName]);
 
 
   // ---------- derived ----------
@@ -4176,7 +4660,7 @@ export default function ContiProgram() {
         <div className="conti-actions">
           {activeLayerType === 'raster' && (
             <button className="conti-icon-btn" onClick={undo}
-              disabled={!selectedFrame || lassoRef.current.phase !== 'idle'}>↶ undo</button>
+              disabled={!selectedFrame || (lassoRef.current.phase !== 'idle' && !(lassoRef.current.transformHistory?.length > 0))}>↶ undo</button>
           )}
           <button className="conti-icon-btn" onClick={() => setSaveDialogOpen(true)}
             title="프로젝트 저장 / 불러오기">📁 project</button>
@@ -4283,12 +4767,12 @@ export default function ContiProgram() {
                     onChange={e => setTypoPresets(prev => prev.map(x => x.id === p.id ? { ...x, name: e.target.value } : x))}
                   />
                   <div className="typo-system-size-wrap">
-                    <input
+                    <NumberInputWithDraft
                       className="typo-system-size"
-                      type="number" min="6" max="200" step="1"
+                      min={6} max={200} step={1}
                       value={p.size}
-                      onChange={e => {
-                        const v = Math.max(6, Math.min(200, parseInt(e.target.value, 10) || 14));
+                      onCommit={raw => {
+                        const v = Math.max(6, Math.min(200, parseInt(raw, 10) || p.size));
                         setTypoPresets(prev => prev.map(x => x.id === p.id ? { ...x, size: v } : x));
                       }}
                     />
@@ -4306,9 +4790,25 @@ export default function ContiProgram() {
                     <option value={800}>800</option>
                     <option value={900}>900</option>
                   </select>
+                  <button
+                    className="del"
+                    title="삭제"
+                    disabled={typoPresets.length <= 1}
+                    onClick={() => setTypoPresets(prev => prev.filter(x => x.id !== p.id))}
+                  >×</button>
                 </div>
               ))}
             </div>
+            <button
+              className="conti-add-btn"
+              onClick={() => {
+                const last = typoPresets[typoPresets.length - 1];
+                setTypoPresets(prev => [
+                  ...prev,
+                  { id: newId(), name: 'New', size: last ? Math.max(6, last.size - 8) : 20, weight: 400 },
+                ]);
+              }}
+            >+ add typo</button>
           </div>
         </aside>
 
@@ -4432,8 +4932,11 @@ export default function ContiProgram() {
                         <span className={`conti-block-tag ${b.type}`}>
                           {b.type === 'cut' ? `c${String(b.num).padStart(2,'0')}` : 'gap'}
                         </span>
-                        <input type="number" min="50" max="5000" step="50" value={b.height}
-                          onChange={e => updateBlockHeight(b.id, e.target.value)} />
+                        <NumberInputWithDraft
+                          min={50} max={5000} step={50}
+                          value={b.height}
+                          onCommit={raw => updateBlockHeight(b.id, raw)}
+                        />
                         <div className="block-height-stepper">
                           <button className="block-height-btn" title="+50px"
                             onClick={() => updateBlockHeight(b.id, String(b.height + 50))}>▲</button>
@@ -4528,6 +5031,9 @@ export default function ContiProgram() {
         onNewProject={handleNewProject}
         onExport={handleExport}
         onImportFile={handleImportFile}
+        onExportPSD={handleExportPSD}
+        hasFrames={frames.length > 0}
+        frameCount={frames.length}
         storageBackend={storageBackend}
       />
     </div>
