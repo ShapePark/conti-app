@@ -193,8 +193,112 @@ const NumberInputWithDraft = ({ value, min, max, step, onCommit, className, styl
 //  PROJECT STORAGE — IndexedDB primary, localStorage fallback
 //  (iPad Safari, desktop browsers, WKWebView App Store apps 모두 호환)
 // ===================================================================
+// ---------- gradient (per-block) ----------
+// gradient = {
+//   start: { x: 0..1, y: 0..1 },   // normalized within the block (cut area for cuts, full width for gaps)
+//   end:   { x: 0..1, y: 0..1 },
+//   stops: [{ offset: 0..1, value: 0..255 }, ...]   // value = grayscale brightness (255 = #FFFFFF, 0 = #000000)
+// }
+const GRADIENT_HANDLE_SIZE = 14;
+const GRADIENT_HANDLE_HIT = 18;
+const GRADIENT_LINE_COLOR = '#3b8efe';
+
+const makeDefaultGradient = () => ({
+  start: { x: 0.5, y: 0 },
+  end:   { x: 0.5, y: 1 },
+  stops: [
+    { id: newId(), offset: 0, value: 217 }, // #D9D9D9
+    { id: newId(), offset: 1, value: 71 },  // #474747
+  ],
+});
+
+const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+const clamp01 = (v) => clamp(v, 0, 1);
+const clampGray = (v) => clamp(Math.round(v), 0, 255);
+
+const grayToHex = (v) => {
+  const n = clampGray(v);
+  const h = n.toString(16).padStart(2, '0').toUpperCase();
+  return `${h}${h}${h}`;
+};
+
+const grayToRgbStr = (v) => {
+  const n = clampGray(v);
+  return `rgb(${n},${n},${n})`;
+};
+
+const hexToGray = (input) => {
+  if (input == null) return null;
+  let s = String(input).replace('#', '').trim();
+  if (s.length === 3) s = s.split('').map(c => c + c).join('');
+  if (!/^[0-9a-fA-F]{6}$/.test(s)) return null;
+  const r = parseInt(s.slice(0, 2), 16);
+  const g = parseInt(s.slice(2, 4), 16);
+  const b = parseInt(s.slice(4, 6), 16);
+  return Math.round((r + g + b) / 3);
+};
+
+// CSS linear-gradient string. Uses pixel-accurate projection so handles match the painted gradient
+// even when start/end don't span the full box (Figma-style behavior).
+const gradientToCss = (g, width, height) => {
+  if (!g || !Array.isArray(g.stops) || g.stops.length === 0) return null;
+  if (g.stops.length === 1) return grayToRgbStr(g.stops[0].value);
+  const sx = g.start.x * width, sy = g.start.y * height;
+  const ex = g.end.x   * width, ey = g.end.y   * height;
+  const dx = ex - sx, dy = ey - sy;
+  const len = Math.hypot(dx, dy);
+  if (len < 1e-6) return grayToRgbStr(g.stops[0].value);
+
+  // CSS angle: measured from "up" (0deg = to-top) clockwise.
+  const cssAngleRad = Math.atan2(dy, dx) + Math.PI / 2;
+  const cssAngleDeg = ((cssAngleRad * 180 / Math.PI) % 360 + 360) % 360;
+
+  // CSS spans the gradient line through the box center, length L:
+  const sinA = Math.sin(cssAngleRad), cosA = Math.cos(cssAngleRad);
+  const L = Math.abs(width * sinA) + Math.abs(height * cosA);
+  if (L < 1e-6) return grayToRgbStr(g.stops[0].value);
+
+  // Project user start/end onto the gradient direction relative to center.
+  const cx = width / 2, cy = height / 2;
+  const ux = dx / len, uy = dy / len;
+  const tStart = (sx - cx) * ux + (sy - cy) * uy;
+  const tEnd   = (ex - cx) * ux + (ey - cy) * uy;
+  const toPct = (t) => ((t + L / 2) / L) * 100;
+
+  const sorted = [...g.stops].sort((a, b) => a.offset - b.offset);
+  const stopStrs = sorted.map(s => {
+    const t = tStart + clamp01(s.offset) * (tEnd - tStart);
+    const pct = toPct(t);
+    return `${grayToRgbStr(s.value)} ${pct.toFixed(3)}%`;
+  });
+  return `linear-gradient(${cssAngleDeg.toFixed(3)}deg, ${stopStrs.join(', ')})`;
+};
+
+// Paint a gradient onto a 2D canvas context (used for PSD export).
+const paintGradientToCtx = (ctx, g, x, y, width, height) => {
+  if (!g || !Array.isArray(g.stops) || g.stops.length === 0) return;
+  if (g.stops.length === 1) {
+    ctx.fillStyle = grayToRgbStr(g.stops[0].value);
+    ctx.fillRect(x, y, width, height);
+    return;
+  }
+  const sx = x + g.start.x * width, sy = y + g.start.y * height;
+  const ex = x + g.end.x   * width, ey = y + g.end.y   * height;
+  const dx = ex - sx, dy = ey - sy;
+  if (Math.hypot(dx, dy) < 1e-6) {
+    ctx.fillStyle = grayToRgbStr(g.stops[0].value);
+    ctx.fillRect(x, y, width, height);
+    return;
+  }
+  const lg = ctx.createLinearGradient(sx, sy, ex, ey);
+  const sorted = [...g.stops].sort((a, b) => a.offset - b.offset);
+  for (const s of sorted) lg.addColorStop(clamp01(s.offset), grayToRgbStr(s.value));
+  ctx.fillStyle = lg;
+  ctx.fillRect(x, y, width, height);
+};
+
 const SCHEMA_VERSION = 1;
-const APP_VERSION = 'conti.v26';
+const APP_VERSION = 'conti.v28';
 const DB_NAME = 'conti_program_db';
 const DB_STORE = 'projects';
 const AUTOSAVE_ID = '__autosave__';
@@ -411,7 +515,14 @@ const findMaxIdInPayload = (data) => {
   if (data?.frames) {
     for (const f of data.frames) {
       seen(f.id);
-      if (Array.isArray(f.blocks)) for (const b of f.blocks) seen(b.id);
+      if (Array.isArray(f.blocks)) {
+        for (const b of f.blocks) {
+          seen(b.id);
+          if (b?.gradient && Array.isArray(b.gradient.stops)) {
+            for (const s of b.gradient.stops) seen(s?.id);
+          }
+        }
+      }
       if (Array.isArray(f.layers)) for (const l of f.layers) seen(l.id);
     }
   }
@@ -873,12 +984,39 @@ const buildFramePsd = async (frame, strokesRef, bubblesByLayer, typoPresets) => 
     canvas: bgCanvas, opacity: 1, hidden: false, blendMode: 'normal',
   };
 
+  // per-block gradient 배경(있을 때만 layer 로 추가)
+  const hasAnyGradient = frame.blocks.some(b => !!b.gradient);
+  let gradientLayer = null;
+  if (hasAnyGradient) {
+    const gc = makeBlankCanvas(canvasW, canvasH);
+    const gctx = gc.getContext('2d');
+    let y = 0;
+    for (const b of frame.blocks) {
+      if (b.gradient) {
+        const ml = b.type === 'cut' ? (b.marginLeft ?? frame.sideMargin) : 0;
+        const mr = b.type === 'cut' ? (b.marginRight ?? frame.sideMargin) : 0;
+        const bw = b.type === 'cut' ? Math.max(10, canvasW - ml - mr) : canvasW;
+        paintGradientToCtx(gctx, b.gradient, ml, y, bw, b.height);
+      }
+      y += b.height;
+    }
+    gradientLayer = {
+      name: '배경 그라데이션',
+      canvas: gc, opacity: 1, hidden: false, blendMode: 'normal',
+    };
+  }
+
   const psd = {
     width: canvasW,
     height: canvasH,
     // 합성용 캔버스(섬네일/플랫 미리보기). CSP 는 레이어를 읽으므로 우선순위 낮음.
     canvas: bgCanvas,
-    children: [guideGroup, conteGroup, bgLayer], // 위 → 아래
+    // children 순서: 위(top)에서 아래(bottom) 로.
+    //   guideGroup (최상단 가이드)
+    //   conteGroup (콘티 레이어들)
+    //   gradientLayer (있으면 콘티 아래)
+    //   bgLayer (최하단 흰 배경)
+    children: [guideGroup, conteGroup, ...(gradientLayer ? [gradientLayer] : []), bgLayer],
   };
 
   const writer = writePsdBuffer || writePsd;
@@ -1844,6 +1982,99 @@ const STYLES = `
   background: var(--paper); border: 1px solid var(--line); border-radius: 3px; text-align: right; color: var(--ink); flex-shrink: 0;
 }
 .conti-block-margin-row input:focus { outline: none; border-color: var(--ink); }
+.conti-block-margin-row.attach-bottom { border-radius: 0; border-bottom: none; margin-bottom: 0; }
+
+/* gradient button in block row */
+.block-grad-btn {
+  width: 22px; height: 22px; display: flex; align-items: center; justify-content: center;
+  font-family: 'JetBrains Mono', monospace; font-size: 9px; font-weight: 700; letter-spacing: 0;
+  flex-shrink: 0; border-radius: 4px;
+  color: var(--muted); background: transparent; border: 1px solid var(--line);
+  transition: all 0.12s ease; padding: 0;
+}
+.block-grad-btn:hover { color: var(--ink); border-color: var(--ink-2); }
+.block-grad-btn.has {
+  color: transparent; border-color: var(--ink-2);
+  box-shadow: inset 0 0 0 1px rgba(255,255,255,0.5);
+}
+.block-grad-btn.editing {
+  border-color: #3b8efe; box-shadow: 0 0 0 1px #3b8efe, inset 0 0 0 1px rgba(255,255,255,0.5);
+}
+
+/* gradient editor sub-row (sits below margin row / block row) */
+.conti-block-gradient-row {
+  display: flex; flex-direction: column; gap: 5px;
+  padding: 8px 8px 8px 8px; margin-top: -1px; margin-bottom: 4px;
+  background: var(--bg-panel); border: 1px solid var(--line); border-top: none;
+  border-radius: 0 0 5px 5px;
+}
+.conti-block-gradient-row.viewport-active {
+  border-color: var(--accent); background: color-mix(in srgb, var(--accent-soft) 60%, var(--bg-panel));
+  box-shadow: inset 3px 0 0 var(--accent);
+}
+.grad-header {
+  display: flex; align-items: center; gap: 5px;
+}
+.grad-label {
+  font-family: 'JetBrains Mono', monospace; font-size: 9px; letter-spacing: 0.1em;
+  color: var(--muted); text-transform: uppercase; flex-shrink: 0;
+}
+.grad-bar {
+  flex: 1; height: 12px; border-radius: 2px; border: 1px solid var(--line); min-width: 0;
+}
+.grad-mini-btn {
+  width: 20px; height: 20px; display: flex; align-items: center; justify-content: center;
+  font-size: 11px; line-height: 1; color: var(--muted);
+  background: var(--paper); border: 1px solid var(--line); border-radius: 3px;
+  flex-shrink: 0; transition: all 0.12s ease;
+}
+.grad-mini-btn:hover { color: var(--ink); border-color: var(--ink-2); }
+.grad-mini-btn.danger:hover { color: var(--accent); border-color: var(--accent); background: var(--accent-soft); }
+.grad-stop-row {
+  display: flex; align-items: center; gap: 5px; min-width: 0;
+}
+.grad-swatch {
+  width: 16px; height: 16px; flex-shrink: 0; border-radius: 3px;
+  border: 1px solid var(--line);
+  box-shadow: inset 0 0 0 1px rgba(255,255,255,0.4);
+}
+.grad-gray-slider {
+  flex: 1; min-width: 0; height: 6px; -webkit-appearance: none; appearance: none;
+  background: linear-gradient(90deg, #ffffff, #000000);
+  border: 1px solid var(--line); border-radius: 999px; outline: none; margin: 0;
+}
+.grad-gray-slider::-webkit-slider-thumb {
+  -webkit-appearance: none; appearance: none; width: 12px; height: 12px;
+  background: var(--paper); border: 2px solid var(--ink); border-radius: 50%; cursor: pointer;
+}
+.grad-gray-slider::-moz-range-thumb {
+  width: 12px; height: 12px; background: var(--paper);
+  border: 2px solid var(--ink); border-radius: 50%; cursor: pointer;
+}
+.grad-hex {
+  font-size: 9px; color: var(--ink-2); letter-spacing: 0.04em;
+  flex-shrink: 0; width: 50px; text-align: center;
+}
+.grad-offset {
+  width: 36px; padding: 2px 3px; font-family: 'JetBrains Mono', monospace; font-size: 10px;
+  background: var(--paper); border: 1px solid var(--line); border-radius: 3px;
+  text-align: right; color: var(--ink); flex-shrink: 0;
+  -moz-appearance: textfield;
+}
+.grad-offset::-webkit-inner-spin-button, .grad-offset::-webkit-outer-spin-button { -webkit-appearance: none; margin: 0; }
+.grad-offset:focus { outline: none; border-color: var(--ink); }
+.grad-offset-unit { font-size: 9px; color: var(--muted); margin-left: -3px; flex-shrink: 0; }
+.grad-stop-del {
+  width: 18px; height: 18px; display: flex; align-items: center; justify-content: center;
+  font-size: 12px; color: var(--muted); border-radius: 3px; flex-shrink: 0;
+  transition: all 0.12s ease;
+}
+.grad-stop-del:hover:not(:disabled) { color: var(--accent); background: var(--accent-soft); }
+.grad-stop-del:disabled { opacity: 0.25; cursor: not-allowed; }
+
+/* gradient editor SVG */
+.conti-gradient-editor { user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; }
+
 .conti-empty {
   padding: 18px 12px; text-align: center; font-size: 12px; color: var(--muted);
   border: 1px dashed var(--line); border-radius: 5px;
@@ -2013,8 +2244,10 @@ const FrameView = forwardRef(function FrameView({
   frame, isSelected, showDimensions, activeTool, selectionPhase,
   getLayerBitmap, bubblesByLayer, selectedBubble, activeLayerType,
   typoPresets, eraserSize, eraserCursor,
+  editingGradientBlockId,
   onSelect, onPointerDown, onPointerMove, onPointerUp,
   onBubbleOverlayPointerDown, onBubbleOverlayPointerMove, onBubbleOverlayPointerUp,
+  onGradientHandlePointerDown, onGradientHandlePointerMove, onGradientHandlePointerUp,
 }, ref) {
   const canvasRef = useRef(null);
   const overlayRef = useRef(null);
@@ -2158,9 +2391,13 @@ const FrameView = forwardRef(function FrameView({
           const ml = b.type === 'cut' ? (b.marginLeft ?? frame.sideMargin) : 0;
           const mr = b.type === 'cut' ? (b.marginRight ?? frame.sideMargin) : 0;
           const bw = b.type === 'cut' ? Math.max(10, frame.canvasWidth - ml - mr) : frame.canvasWidth;
+          const bg = b.gradient ? gradientToCss(b.gradient, bw, b.height) : null;
           return (
-            <div key={b.id} className={`conti-block ${b.type}`}
-              style={{ top: `${b.top}px`, left: `${ml}px`, width: `${bw}px`, height: `${b.height}px` }} />
+            <div key={b.id} className={`conti-block ${b.type}${b.gradient ? ' has-gradient' : ''}`}
+              style={{
+                top: `${b.top}px`, left: `${ml}px`, width: `${bw}px`, height: `${b.height}px`,
+                ...(bg ? { background: bg } : null),
+              }} />
           );
         })}
         <canvas ref={canvasRef} className="conti-frame-canvas" style={{ touchAction: 'none' }} onContextMenu={e => e.preventDefault()} />
@@ -2219,6 +2456,52 @@ const FrameView = forwardRef(function FrameView({
             else onPointerUp(e, overlayRef.current);
           }}
         />
+
+        {/* Gradient handle SVG (Figma-style) — only when editing a block's gradient in this frame */}
+        {isSelected && editingGradientBlockId != null && (() => {
+          const b = blockLayout.find(x => x.id === editingGradientBlockId);
+          if (!b || !b.gradient) return null;
+          const ml = b.type === 'cut' ? (b.marginLeft ?? frame.sideMargin) : 0;
+          const mr = b.type === 'cut' ? (b.marginRight ?? frame.sideMargin) : 0;
+          const bw = b.type === 'cut' ? Math.max(10, frame.canvasWidth - ml - mr) : frame.canvasWidth;
+          const g = b.gradient;
+          const sx = ml + g.start.x * bw, sy = b.top + g.start.y * b.height;
+          const ex = ml + g.end.x   * bw, ey = b.top + g.end.y   * b.height;
+          const HS = GRADIENT_HANDLE_SIZE;
+          const handleStart = (ev, which) => {
+            ev.stopPropagation();
+            onGradientHandlePointerDown?.(ev, frame.id, b.id, which);
+          };
+          return (
+            <svg className="conti-gradient-editor"
+              width={frame.canvasWidth} height={totalHeight}
+              style={{ position: 'absolute', top: 0, left: 0, overflow: 'visible', zIndex: 9, pointerEvents: 'none' }}>
+              {/* outer outline (white for visibility on dark gradients) */}
+              <line x1={sx} y1={sy} x2={ex} y2={ey} stroke="#ffffff" strokeWidth="3" strokeOpacity="0.85" />
+              <line x1={sx} y1={sy} x2={ex} y2={ey} stroke={GRADIENT_LINE_COLOR} strokeWidth="1.5" />
+              {/* start handle (white-filled square) */}
+              <rect
+                x={sx - HS / 2} y={sy - HS / 2} width={HS} height={HS}
+                fill="#ffffff" stroke={GRADIENT_LINE_COLOR} strokeWidth="2"
+                style={{ pointerEvents: 'all', cursor: 'move', touchAction: 'none' }}
+                onPointerDown={ev => handleStart(ev, 'start')}
+                onPointerMove={ev => onGradientHandlePointerMove?.(ev)}
+                onPointerUp={ev => onGradientHandlePointerUp?.(ev)}
+                onPointerCancel={ev => onGradientHandlePointerUp?.(ev)}
+              />
+              {/* end handle (blue-filled square) */}
+              <rect
+                x={ex - HS / 2} y={ey - HS / 2} width={HS} height={HS}
+                fill={GRADIENT_LINE_COLOR} stroke="#ffffff" strokeWidth="2"
+                style={{ pointerEvents: 'all', cursor: 'move', touchAction: 'none' }}
+                onPointerDown={ev => handleStart(ev, 'end')}
+                onPointerMove={ev => onGradientHandlePointerMove?.(ev)}
+                onPointerUp={ev => onGradientHandlePointerUp?.(ev)}
+                onPointerCancel={ev => onGradientHandlePointerUp?.(ev)}
+              />
+            </svg>
+          );
+        })()}
 
         {/* Eraser cursor visual */}
         {activeTool === 'eraser' && isSelected && eraserCursor && (
@@ -2474,6 +2757,14 @@ export default function ContiProgram() {
   const [dragOverPos, setDragOverPos] = useState(null);
   const blockListRef = useRef(null);
   const [activeBlockId, setActiveBlockId] = useState(null);
+
+  // ---------- gradient editing ----------
+  // editingGradientBlockId: id of the block currently in "edit gradient" mode (handles visible + stops panel open). null = none.
+  const [editingGradientBlockId, setEditingGradientBlockId] = useState(null);
+  const gradientDragRef = useRef(null);
+  // refs needed by gradient handle move (avoid stale closures)
+  const framesRef = useRef(frames);
+  useEffect(() => { framesRef.current = frames; }, [frames]);
 
   // ---------- layer-row drag ----------
   const [layerDragId, setLayerDragId] = useState(null);
@@ -3809,6 +4100,155 @@ export default function ContiProgram() {
   };
 
   // ===================================================================
+  //  GRADIENT — per-block grayscale gradient (#FFFFFF ↔ #000000)
+  //  Figma-style: two endpoints in normalized (0..1) coords + sorted stops.
+  // ===================================================================
+  const mutateBlockGradient = useCallback((blockId, mutator) => {
+    setFrames(arr => arr.map(f => f.id !== selectedFrameId ? f : ({
+      ...f, blocks: f.blocks.map(b => {
+        if (b.id !== blockId) return b;
+        const next = mutator(b.gradient);
+        if (next === undefined) return b;          // no change
+        if (next === null) {
+          const { gradient, ...rest } = b;          // remove gradient
+          return rest;
+        }
+        return { ...b, gradient: next };
+      }),
+    })));
+  }, [selectedFrameId]);
+
+  const addGradient = useCallback((blockId) => {
+    mutateBlockGradient(blockId, g => g || makeDefaultGradient());
+    setEditingGradientBlockId(blockId);
+  }, [mutateBlockGradient]);
+
+  const removeGradient = useCallback((blockId) => {
+    mutateBlockGradient(blockId, () => null);
+    setEditingGradientBlockId(curr => curr === blockId ? null : curr);
+  }, [mutateBlockGradient]);
+
+  const toggleEditGradient = useCallback((blockId) => {
+    setEditingGradientBlockId(curr => curr === blockId ? null : blockId);
+  }, []);
+
+  const addGradientStop = useCallback((blockId) => {
+    mutateBlockGradient(blockId, g => {
+      if (!g) return g;
+      const sorted = [...g.stops].sort((a, b) => a.offset - b.offset);
+      // find the biggest gap between existing stops to place the new one
+      let bestGap = -1, bestPos = 0.5, bestLeft = sorted[0]?.value ?? 128, bestRight = sorted[0]?.value ?? 128;
+      for (let i = 0; i < sorted.length - 1; i++) {
+        const gap = sorted[i + 1].offset - sorted[i].offset;
+        if (gap > bestGap) { bestGap = gap; bestPos = (sorted[i].offset + sorted[i + 1].offset) / 2; bestLeft = sorted[i].value; bestRight = sorted[i + 1].value; }
+      }
+      const newStop = { id: newId(), offset: clamp01(bestPos), value: clampGray((bestLeft + bestRight) / 2) };
+      return { ...g, stops: [...sorted, newStop].sort((a, b) => a.offset - b.offset) };
+    });
+  }, [mutateBlockGradient]);
+
+  const removeGradientStop = useCallback((blockId, stopIndex) => {
+    mutateBlockGradient(blockId, g => {
+      if (!g) return g;
+      if (g.stops.length <= 2) return g;            // keep at least 2 stops
+      const sorted = [...g.stops].sort((a, b) => a.offset - b.offset);
+      sorted.splice(stopIndex, 1);
+      return { ...g, stops: sorted };
+    });
+  }, [mutateBlockGradient]);
+
+  const updateGradientStop = useCallback((blockId, stopIndex, patch) => {
+    mutateBlockGradient(blockId, g => {
+      if (!g) return g;
+      const sorted = [...g.stops].sort((a, b) => a.offset - b.offset);
+      const cur = sorted[stopIndex];
+      if (!cur) return g;
+      const next = { ...cur };
+      if (patch.offset != null) next.offset = clamp01(patch.offset);
+      if (patch.value  != null) next.value  = clampGray(patch.value);
+      sorted[stopIndex] = next;
+      return { ...g, stops: sorted };
+    });
+  }, [mutateBlockGradient]);
+
+  const swapGradientEnds = useCallback((blockId) => {
+    mutateBlockGradient(blockId, g => {
+      if (!g) return g;
+      return {
+        ...g,
+        start: g.end,
+        end: g.start,
+        // also mirror stops so the visual gradient stays the same direction
+        stops: g.stops.map(s => ({ ...s, offset: 1 - s.offset })).sort((a, b) => a.offset - b.offset),
+      };
+    });
+  }, [mutateBlockGradient]);
+
+  // ---------- gradient handle pointer handling (Figma-style canvas drag) ----------
+  const handleGradientHandlePointerDown = useCallback((e, frameId, blockId, which) => {
+    e.preventDefault();
+    e.stopPropagation();
+    const target = e.currentTarget;
+    try { target.setPointerCapture(e.pointerId); } catch (_) {}
+    gradientDragRef.current = { frameId, blockId, which, pointerId: e.pointerId, target };
+  }, []);
+
+  const handleGradientHandlePointerMove = useCallback((e) => {
+    const drag = gradientDragRef.current;
+    if (!drag || drag.pointerId !== e.pointerId) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const frame = framesRef.current.find(f => f.id === drag.frameId);
+    if (!frame) return;
+    const block = frame.blocks.find(b => b.id === drag.blockId);
+    if (!block) return;
+
+    const frameEl = canvasAreaRef.current?.querySelector(`[data-frame-id="${drag.frameId}"]`);
+    const stageEl = frameEl?.querySelector('.conti-frame-stage');
+    if (!stageEl) return;
+    const rect = stageEl.getBoundingClientRect();
+    if (rect.width === 0 || rect.height === 0) return;
+
+    const totalH = frame.blocks.reduce((s, x) => s + x.height, 0);
+    const scaleX = frame.canvasWidth / rect.width;
+    const scaleY = totalH / rect.height;
+    const xInStage = (e.clientX - rect.left) * scaleX;
+    const yInStage = (e.clientY - rect.top)  * scaleY;
+
+    let top = 0;
+    for (const x of frame.blocks) { if (x.id === block.id) break; top += x.height; }
+
+    const ml = block.type === 'cut' ? (block.marginLeft ?? frame.sideMargin) : 0;
+    const mr = block.type === 'cut' ? (block.marginRight ?? frame.sideMargin) : 0;
+    const bw = block.type === 'cut' ? Math.max(10, frame.canvasWidth - ml - mr) : frame.canvasWidth;
+
+    const nx = clamp01((xInStage - ml) / bw);
+    const ny = clamp01((yInStage - top) / Math.max(1, block.height));
+
+    setFrames(arr => arr.map(f => f.id !== drag.frameId ? f : ({
+      ...f, blocks: f.blocks.map(b => {
+        if (b.id !== drag.blockId || !b.gradient) return b;
+        return { ...b, gradient: { ...b.gradient, [drag.which]: { x: nx, y: ny } } };
+      }),
+    })));
+  }, []);
+
+  const handleGradientHandlePointerUp = useCallback((e) => {
+    const drag = gradientDragRef.current;
+    if (!drag || drag.pointerId !== e.pointerId) return;
+    try { drag.target?.releasePointerCapture?.(drag.pointerId); } catch (_) {}
+    gradientDragRef.current = null;
+  }, []);
+
+  // ESC closes gradient edit mode
+  useEffect(() => {
+    if (editingGradientBlockId == null) return;
+    const onKey = (e) => { if (e.key === 'Escape') setEditingGradientBlockId(null); };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [editingGradientBlockId]);
+
+  // ===================================================================
   //  Viewport-center block tracking
   // ===================================================================
   useEffect(() => {
@@ -4689,13 +5129,19 @@ export default function ContiProgram() {
               <h3>가로 system</h3>
               <div className="conti-config-row">
                 <label>canvas</label>
-                <input type="number" min="200" max="2000" step="2" value={selectedFrame.canvasWidth}
-                  onChange={e => { const v = parseInt(e.target.value, 10); if (Number.isFinite(v)) updateFrameDim(selectedFrameId, 'canvasWidth', Math.max(200, Math.min(2000, v))); }} />
+                <NumberInputWithDraft
+                  min={200} max={2000} step={2}
+                  value={selectedFrame.canvasWidth}
+                  onCommit={raw => { const v = parseInt(raw, 10); if (Number.isFinite(v)) updateFrameDim(selectedFrameId, 'canvasWidth', Math.max(200, Math.min(2000, v))); }}
+                />
               </div>
               <div className="conti-config-row">
                 <label>side margin</label>
-                <input type="number" min="0" max="500" step="2" value={selectedFrame.sideMargin}
-                  onChange={e => { const v = parseInt(e.target.value, 10); if (Number.isFinite(v)) updateFrameDim(selectedFrameId, 'sideMargin', Math.max(0, Math.min(500, v))); }} />
+                <NumberInputWithDraft
+                  min={0} max={500} step={2}
+                  value={selectedFrame.sideMargin}
+                  onCommit={raw => { const v = parseInt(raw, 10); if (Number.isFinite(v)) updateFrameDim(selectedFrameId, 'sideMargin', Math.max(0, Math.min(500, v))); }}
+                />
               </div>
               <div className="conti-config-row">
                 <label>cut width</label>
@@ -4831,6 +5277,7 @@ export default function ContiProgram() {
                 typoPresets={typoPresets}
                 eraserSize={eraserSize}
                 eraserCursor={f.id === selectedFrameId ? eraserCursor : null}
+                editingGradientBlockId={f.id === selectedFrameId ? editingGradientBlockId : null}
                 onSelect={setSelectedFrameId}
                 onPointerDown={handlePointerDown}
                 onPointerMove={handlePointerMove}
@@ -4838,6 +5285,9 @@ export default function ContiProgram() {
                 onBubbleOverlayPointerDown={handleBubbleOverlayPointerDown}
                 onBubbleOverlayPointerMove={handleBubbleOverlayPointerMove}
                 onBubbleOverlayPointerUp={handleBubbleOverlayPointerUp}
+                onGradientHandlePointerDown={handleGradientHandlePointerDown}
+                onGradientHandlePointerMove={handleGradientHandlePointerMove}
+                onGradientHandlePointerUp={handleGradientHandlePointerUp}
               />
             ))}
           </div>
@@ -4914,10 +5364,15 @@ export default function ContiProgram() {
                   const showAbove = dragOverId === b.id && dragOverPos === 'above' && dragId !== b.id;
                   const showBelow = dragOverId === b.id && dragOverPos === 'below' && dragId !== b.id;
                   const isCut = b.type === 'cut';
+                  const isEditingGrad = editingGradientBlockId === b.id;
+                  const hasGrad = !!b.gradient;
+                  // attach-bottom: row should have flat bottom because another row sits directly under it
+                  const mainAttachBottom = isCut || isEditingGrad;
+                  const marginAttachBottom = isCut && isEditingGrad;
                   return (
                     <div key={b.id} data-block-id={b.id}>
                       {showAbove && <div style={{ position:'relative',height:3,background:'var(--accent)',borderRadius:2,margin:'0 0 2px 0' }} />}
-                      <div className={`conti-block-row${isCut ? ' has-margin' : ''} ${dragId === b.id ? 'dragging' : ''} ${b.id === activeBlockId ? 'viewport-active' : ''}`}>
+                      <div className={`conti-block-row${mainAttachBottom ? ' has-margin' : ''} ${dragId === b.id ? 'dragging' : ''} ${b.id === activeBlockId ? 'viewport-active' : ''}`}>
                         <button className="conti-drag-handle"
                           onPointerDown={e => handleHandlePointerDown(e, b.id)}
                           onPointerMove={handleHandlePointerMove}
@@ -4944,10 +5399,18 @@ export default function ContiProgram() {
                             onClick={() => updateBlockHeight(b.id, String(b.height - 50))}>▼</button>
                         </div>
                         <span className="conti-tool-unit mono">px</span>
+                        <button
+                          className={`block-grad-btn${hasGrad ? ' has' : ''}${isEditingGrad ? ' editing' : ''}`}
+                          title={hasGrad ? (isEditingGrad ? '그라데이션 편집 닫기' : '그라데이션 편집') : '그라데이션 추가'}
+                          onClick={() => { if (hasGrad) toggleEditGradient(b.id); else addGradient(b.id); }}
+                          style={hasGrad ? { background: gradientToCss(b.gradient, 22, 22) || 'transparent' } : null}
+                        >
+                          {hasGrad ? '' : 'G'}
+                        </button>
                         <button className="del" onClick={() => removeBlock(b.id)} title="삭제">×</button>
                       </div>
                       {isCut && (
-                        <div className={`conti-block-margin-row${b.id === activeBlockId ? ' viewport-active' : ''}`}>
+                        <div className={`conti-block-margin-row${marginAttachBottom ? ' attach-bottom' : ''}${b.id === activeBlockId ? ' viewport-active' : ''}`}>
                           <span className="conti-margin-label">L</span>
                           <input type="number" min="0" max="500" step="2"
                             value={b.marginLeft ?? selectedFrame.sideMargin}
@@ -4957,6 +5420,41 @@ export default function ContiProgram() {
                             value={b.marginRight ?? selectedFrame.sideMargin}
                             onChange={e => updateBlockMargin(b.id, 'marginRight', e.target.value)} />
                           <span className="conti-margin-label">R</span>
+                        </div>
+                      )}
+                      {isEditingGrad && b.gradient && (
+                        <div className={`conti-block-gradient-row${b.id === activeBlockId ? ' viewport-active' : ''}`}>
+                          <div className="grad-header">
+                            <span className="grad-label">GRADIENT</span>
+                            <div className="grad-bar"
+                                 style={{ background: gradientToCss({ ...b.gradient, start: { x: 0, y: 0.5 }, end: { x: 1, y: 0.5 } }, 100, 1) || '#ccc' }} />
+                            <button className="grad-mini-btn" title="시작/끝 뒤집기"
+                              onClick={() => swapGradientEnds(b.id)}>⇄</button>
+                            <button className="grad-mini-btn" title="stop 추가"
+                              onClick={() => addGradientStop(b.id)}>+</button>
+                            <button className="grad-mini-btn danger" title="그라데이션 제거"
+                              onClick={() => removeGradient(b.id)}>✕</button>
+                          </div>
+                          {[...b.gradient.stops]
+                            .map((s, originalIdx) => ({ s, originalIdx }))
+                            .sort((a, c) => a.s.offset - c.s.offset)
+                            .map(({ s: stop }, sortedIdx) => (
+                              <div className="grad-stop-row" key={stop.id ?? sortedIdx}>
+                                <span className="grad-swatch" style={{ background: grayToRgbStr(stop.value) }} />
+                                <input className="grad-gray-slider" type="range" min="0" max="255" step="1"
+                                  value={stop.value}
+                                  onChange={e => updateGradientStop(b.id, sortedIdx, { value: Number(e.target.value) })} />
+                                <span className="grad-hex mono">{grayToHex(stop.value)}</span>
+                                <input className="grad-offset mono" type="number" min="0" max="100" step="1"
+                                  value={Math.round(stop.offset * 100)}
+                                  onChange={e => updateGradientStop(b.id, sortedIdx, { offset: Number(e.target.value) / 100 })} />
+                                <span className="grad-offset-unit mono">%</span>
+                                <button className="grad-stop-del"
+                                  disabled={b.gradient.stops.length <= 2}
+                                  onClick={() => removeGradientStop(b.id, sortedIdx)}
+                                  title="stop 삭제">−</button>
+                              </div>
+                          ))}
                         </div>
                       )}
                       {showBelow && <div style={{ position:'relative',height:3,background:'var(--accent)',borderRadius:2,margin:'2px 0 0 0' }} />}
