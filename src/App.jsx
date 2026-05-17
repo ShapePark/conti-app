@@ -201,18 +201,17 @@ const NumberInputWithDraft = ({ value, min, max, step, onCommit, className, styl
 // }
 
 // ---------- flat color (per-block) ----------
-// FFFFFF → 111111 → 222222 → ... → 999999 → 000000  (11 swatches)
+// 10 steps: FFFFFF → evenly spaced → 000000
 const FLAT_COLOR_STEPS = [
   { hex: 'FFFFFF', value: 255 },
-  { hex: '111111', value: 17  },
-  { hex: '222222', value: 34  },
-  { hex: '333333', value: 51  },
-  { hex: '444444', value: 68  },
+  { hex: 'E3E3E3', value: 227 },
+  { hex: 'C6C6C6', value: 198 },
+  { hex: 'AAAAAA', value: 170 },
+  { hex: '8E8E8E', value: 142 },
+  { hex: '717171', value: 113 },
   { hex: '555555', value: 85  },
-  { hex: '666666', value: 102 },
-  { hex: '777777', value: 119 },
-  { hex: '888888', value: 136 },
-  { hex: '999999', value: 153 },
+  { hex: '393939', value: 57  },
+  { hex: '1C1C1C', value: 28  },
   { hex: '000000', value: 0   },
 ];
 const GRADIENT_HANDLE_SIZE = 14;
@@ -2290,6 +2289,22 @@ const STYLES = `
 .conti-modal-usage { font-size: 11px; color: var(--muted); }
 
 /* mobile/tablet */
+/* gradient color handle slider */
+.grad-color-handle-slider {
+  -webkit-appearance: none; appearance: none;
+  width: 100%; height: 4px;
+  background: linear-gradient(to right, #000, #fff);
+  border-radius: 999px; outline: none; display: block; margin-bottom: 0;
+}
+.grad-color-handle-slider::-webkit-slider-thumb {
+  -webkit-appearance: none; appearance: none;
+  width: 14px; height: 14px; border-radius: 50%;
+  background: var(--paper, #fdfbf5);
+  border: 2px solid var(--ink, #16140f);
+  box-shadow: 0 1px 4px rgba(0,0,0,0.22);
+  cursor: pointer;
+}
+
 @media (max-width: 600px) {
   .conti-modal-backdrop { padding: 10px; }
   .conti-modal { max-height: calc(100vh - 20px); }
@@ -2303,6 +2318,122 @@ const STYLES = `
 @media (max-width: 700px) { .conti-sidebar { width: 200px; flex: 0 0 200px; } .conti-tool input[type="range"] { width: 70px; } }
 `;
 
+// ---------- GradientColorHandle ----------
+// 캔버스 위 그라데이션 시작/끝 핸들 옆에 떠있는 컬러 컨트롤러
+const GradientColorHandle = ({ x, y, stopValue, which, frameWidth, frameHeight, onChange }) => {
+  const [open, setOpen] = useState(false);
+
+  // 패널이 프레임 밖으로 나가지 않도록 방향 결정
+  const openLeft = x + 168 > frameWidth;
+  const openUp   = y + 190 > frameHeight && y > 130;
+
+  return (
+    <div
+      style={{
+        position: 'absolute', left: x, top: y,
+        transform: 'translate(-50%, -50%)',
+        zIndex: 14, pointerEvents: 'all',
+      }}
+      onPointerDown={e => e.stopPropagation()}
+    >
+      {/* 색상 스왓치 버튼 */}
+      <button
+        style={{
+          width: 20, height: 20, borderRadius: '50%', padding: 0,
+          background: grayToRgbStr(stopValue),
+          border: '2.5px solid #fff',
+          boxShadow: `0 0 0 1.5px ${GRADIENT_LINE_COLOR}, 0 1px 4px rgba(0,0,0,0.22)`,
+          cursor: 'pointer', display: 'block', outline: 'none',
+          transition: 'transform 0.12s',
+        }}
+        title={`${which === 'start' ? '시작' : '끝'} 색상 · #${grayToHex(stopValue)}`}
+        onClick={e => { e.stopPropagation(); setOpen(o => !o); }}
+        onPointerDown={e => e.stopPropagation()}
+      />
+
+      {open && (
+        <div
+          style={{
+            position: 'absolute',
+            ...(openLeft ? { right: 14 } : { left: 14 }),
+            ...(openUp   ? { bottom: 0 } : { top: -8 }),
+            background: 'var(--paper, #fdfbf5)',
+            border: '1px solid var(--line, #cac3b1)',
+            borderRadius: 9, padding: '10px 11px',
+            boxShadow: '0 4px 18px rgba(0,0,0,0.18)',
+            zIndex: 16, minWidth: 154, pointerEvents: 'all',
+          }}
+          onPointerDown={e => e.stopPropagation()}
+          onClick={e => e.stopPropagation()}
+        >
+          {/* 라벨 */}
+          <div style={{
+            fontFamily: "'JetBrains Mono', monospace", fontSize: 9,
+            letterSpacing: '0.1em', textTransform: 'uppercase',
+            color: 'var(--muted, #837e72)', marginBottom: 7,
+            display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+          }}>
+            <span>{which === 'start' ? 'start' : 'end'} color</span>
+            <button
+              style={{
+                fontSize: 13, lineHeight: 1, padding: 0, color: 'var(--muted, #837e72)',
+                background: 'none', border: 'none', cursor: 'pointer',
+              }}
+              onClick={e => { e.stopPropagation(); setOpen(false); }}
+            >×</button>
+          </div>
+
+          {/* 미리보기 바 */}
+          <div style={{
+            height: 22, borderRadius: 4, marginBottom: 8,
+            background: grayToRgbStr(stopValue),
+            border: '1px solid rgba(0,0,0,0.1)',
+          }} />
+
+          {/* 그레이스케일 스왓치 10단계 */}
+          <div style={{ display: 'flex', gap: 3, marginBottom: 8 }}>
+            {FLAT_COLOR_STEPS.map(step => (
+              <button
+                key={step.hex}
+                style={{
+                  flex: 1, height: 16, borderRadius: 3, padding: 0,
+                  background: `#${step.hex}`,
+                  border: Math.abs(stopValue - step.value) < 10
+                    ? `2px solid ${GRADIENT_LINE_COLOR}`
+                    : '2px solid transparent',
+                  cursor: 'pointer', outline: 'none',
+                  boxShadow: 'inset 0 0 0 1px rgba(0,0,0,0.1)',
+                }}
+                title={`#${step.hex}`}
+                onClick={e => { e.stopPropagation(); onChange(step.value); }}
+                onPointerDown={e => e.stopPropagation()}
+              />
+            ))}
+          </div>
+
+          {/* 슬라이더 */}
+          <input
+            type="range" min="0" max="255" step="1"
+            value={stopValue}
+            className="grad-color-handle-slider"
+            onChange={e => onChange(Number(e.target.value))}
+            onPointerDown={e => e.stopPropagation()}
+          />
+
+          {/* 헥스값 */}
+          <div style={{
+            textAlign: 'center', marginTop: 4,
+            fontFamily: "'JetBrains Mono', monospace",
+            fontSize: 11, color: 'var(--ink-2, #3a3631)', letterSpacing: '0.04em',
+          }}>
+            #{grayToHex(stopValue)}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
+
 // ---------- FrameView ----------
 const FrameView = forwardRef(function FrameView({
   frame, isSelected, showDimensions, activeTool, selectionPhase,
@@ -2312,6 +2443,7 @@ const FrameView = forwardRef(function FrameView({
   onSelect, onPointerDown, onPointerMove, onPointerUp,
   onBubbleOverlayPointerDown, onBubbleOverlayPointerMove, onBubbleOverlayPointerUp,
   onGradientHandlePointerDown, onGradientHandlePointerMove, onGradientHandlePointerUp,
+  onGradientStopColorChange,
 }, ref) {
   const canvasRef = useRef(null);
   const overlayRef = useRef(null);
@@ -2567,6 +2699,46 @@ const FrameView = forwardRef(function FrameView({
                 onPointerCancel={ev => onGradientHandlePointerUp?.(ev)}
               />
             </svg>
+          );
+        })()}
+
+        {/* 그라데이션 색상 컨트롤러 — start/end 핸들 옆에 색상을 바로 바꿀 수 있는 인라인 피커 */}
+        {isSelected && editingGradientBlockId != null && (() => {
+          const b = blockLayout.find(x => x.id === editingGradientBlockId);
+          if (!b?.gradient) return null;
+          const ml = b.type === 'cut' ? (b.marginLeft ?? frame.sideMargin) : 0;
+          const bw = b.type === 'cut' ? Math.max(10, frame.canvasWidth - ml - (b.marginRight ?? frame.sideMargin)) : frame.canvasWidth;
+          const g = b.gradient;
+          const sorted = [...g.stops].sort((a, c) => a.offset - c.offset);
+          const startStop = sorted[0];
+          const endStop   = sorted[sorted.length - 1];
+          const sx = ml + g.start.x * bw, sy = b.top + g.start.y * b.height;
+          const ex = ml + g.end.x   * bw, ey = b.top + g.end.y   * b.height;
+          return (
+            <>
+              {startStop && (
+                <GradientColorHandle
+                  key={`gch-start-${editingGradientBlockId}`}
+                  x={sx} y={sy}
+                  stopValue={startStop.value}
+                  which="start"
+                  frameWidth={frame.canvasWidth}
+                  frameHeight={totalHeight}
+                  onChange={val => onGradientStopColorChange?.(frame.id, b.id, startStop.id, val)}
+                />
+              )}
+              {endStop && endStop.id !== startStop?.id && (
+                <GradientColorHandle
+                  key={`gch-end-${editingGradientBlockId}`}
+                  x={ex} y={ey}
+                  stopValue={endStop.value}
+                  which="end"
+                  frameWidth={frame.canvasWidth}
+                  frameHeight={totalHeight}
+                  onChange={val => onGradientStopColorChange?.(frame.id, b.id, endStop.id, val)}
+                />
+              )}
+            </>
           );
         })()}
 
@@ -4242,6 +4414,21 @@ export default function ContiProgram() {
     });
   }, [mutateBlockGradient]);
 
+  // 캔버스 위 색상 컨트롤러에서 stop id 로 직접 색상 변경
+  const updateGradientStopById = useCallback((blockId, stopId, value) => {
+    mutateBlockGradient(blockId, g => {
+      if (!g) return g;
+      return { ...g, stops: g.stops.map(s => s.id === stopId ? { ...s, value: clampGray(value) } : s) };
+    });
+    requestAutosaveRef.current?.();
+  }, [mutateBlockGradient]);
+
+  // FrameView 에 넘기는 핸들러: (frameId, blockId, stopId, value)
+  const handleGradientStopColorChange = useCallback((frameId, blockId, stopId, value) => {
+    // 현재 선택된 프레임에서만 동작 (editingGradientBlockId가 설정된 상태)
+    updateGradientStopById(blockId, stopId, value);
+  }, [updateGradientStopById]);
+
   const swapGradientEnds = useCallback((blockId) => {
     mutateBlockGradient(blockId, g => {
       if (!g) return g;
@@ -5383,6 +5570,7 @@ export default function ContiProgram() {
                 onGradientHandlePointerDown={handleGradientHandlePointerDown}
                 onGradientHandlePointerMove={handleGradientHandlePointerMove}
                 onGradientHandlePointerUp={handleGradientHandlePointerUp}
+                onGradientStopColorChange={handleGradientStopColorChange}
               />
             ))}
           </div>
