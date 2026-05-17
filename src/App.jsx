@@ -199,6 +199,22 @@ const NumberInputWithDraft = ({ value, min, max, step, onCommit, className, styl
 //   end:   { x: 0..1, y: 0..1 },
 //   stops: [{ offset: 0..1, value: 0..255 }, ...]   // value = grayscale brightness (255 = #FFFFFF, 0 = #000000)
 // }
+
+// ---------- flat color (per-block) ----------
+// FFFFFF → 111111 → 222222 → ... → 999999 → 000000  (11 swatches)
+const FLAT_COLOR_STEPS = [
+  { hex: 'FFFFFF', value: 255 },
+  { hex: '111111', value: 17  },
+  { hex: '222222', value: 34  },
+  { hex: '333333', value: 51  },
+  { hex: '444444', value: 68  },
+  { hex: '555555', value: 85  },
+  { hex: '666666', value: 102 },
+  { hex: '777777', value: 119 },
+  { hex: '888888', value: 136 },
+  { hex: '999999', value: 153 },
+  { hex: '000000', value: 0   },
+];
 const GRADIENT_HANDLE_SIZE = 14;
 const GRADIENT_HANDLE_HIT = 18;
 const GRADIENT_LINE_COLOR = '#3b8efe';
@@ -298,7 +314,7 @@ const paintGradientToCtx = (ctx, g, x, y, width, height) => {
 };
 
 const SCHEMA_VERSION = 1;
-const APP_VERSION = 'conti.v28';
+const APP_VERSION = 'conti.v29';
 const DB_NAME = 'conti_program_db';
 const DB_STORE = 'projects';
 const AUTOSAVE_ID = '__autosave__';
@@ -986,22 +1002,29 @@ const buildFramePsd = async (frame, strokesRef, bubblesByLayer, typoPresets) => 
 
   // per-block gradient 배경(있을 때만 layer 로 추가)
   const hasAnyGradient = frame.blocks.some(b => !!b.gradient);
+  const hasAnyFlatColor = frame.blocks.some(b => b.flatColor != null);
   let gradientLayer = null;
-  if (hasAnyGradient) {
+  if (hasAnyGradient || hasAnyFlatColor) {
     const gc = makeBlankCanvas(canvasW, canvasH);
     const gctx = gc.getContext('2d');
     let y = 0;
     for (const b of frame.blocks) {
+      const ml = b.type === 'cut' ? (b.marginLeft ?? frame.sideMargin) : 0;
+      const mr = b.type === 'cut' ? (b.marginRight ?? frame.sideMargin) : 0;
+      const bw = b.type === 'cut' ? Math.max(10, canvasW - ml - mr) : canvasW;
+      // flat color first (underneath gradient)
+      if (b.flatColor != null) {
+        gctx.fillStyle = grayToRgbStr(b.flatColor);
+        gctx.fillRect(ml, y, bw, b.height);
+      }
+      // gradient on top
       if (b.gradient) {
-        const ml = b.type === 'cut' ? (b.marginLeft ?? frame.sideMargin) : 0;
-        const mr = b.type === 'cut' ? (b.marginRight ?? frame.sideMargin) : 0;
-        const bw = b.type === 'cut' ? Math.max(10, canvasW - ml - mr) : canvasW;
         paintGradientToCtx(gctx, b.gradient, ml, y, bw, b.height);
       }
       y += b.height;
     }
     gradientLayer = {
-      name: '배경 그라데이션',
+      name: '배경 (색상/그라데이션)',
       canvas: gc, opacity: 1, hidden: false, blendMode: 'normal',
     };
   }
@@ -2075,6 +2098,47 @@ const STYLES = `
 /* gradient editor SVG */
 .conti-gradient-editor { user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; }
 
+/* flat color button (next to gradient button) */
+.block-flat-btn {
+  width: 22px; height: 22px; border-radius: 4px; flex-shrink: 0;
+  border: 1.5px solid var(--line); cursor: pointer; font-size: 9px;
+  font-family: 'JetBrains Mono', monospace; letter-spacing: 0.04em;
+  color: var(--muted); background: var(--paper);
+  display: flex; align-items: center; justify-content: center;
+  transition: all 0.12s ease;
+}
+.block-flat-btn:hover { border-color: var(--ink-2); color: var(--ink); }
+.block-flat-btn.has { border-width: 2px; border-color: var(--ink-2); }
+.block-flat-btn.editing { border-color: #3b8efe; box-shadow: 0 0 0 1px #3b8efe; }
+
+/* flat color swatch picker row */
+.conti-block-flat-row {
+  display: flex; align-items: center; gap: 5px; flex-wrap: wrap;
+  padding: 7px 8px; margin-top: -1px; margin-bottom: 4px;
+  background: var(--bg-panel); border: 1px solid var(--line); border-top: none;
+  border-radius: 0 0 5px 5px;
+}
+.conti-block-flat-row.viewport-active {
+  border-color: var(--accent); background: color-mix(in srgb, var(--accent-soft) 60%, var(--bg-panel));
+  box-shadow: inset 3px 0 0 var(--accent);
+}
+.flat-color-label {
+  font-family: 'JetBrains Mono', monospace; font-size: 9px; letter-spacing: 0.1em;
+  color: var(--muted); text-transform: uppercase; flex-shrink: 0; margin-right: 2px;
+}
+.flat-swatch {
+  width: 18px; height: 18px; border-radius: 3px; cursor: pointer; flex-shrink: 0;
+  border: 1.5px solid rgba(0,0,0,0.18); transition: transform 0.1s ease, box-shadow 0.1s ease;
+}
+.flat-swatch:hover { transform: scale(1.18); box-shadow: 0 0 0 1.5px var(--ink); }
+.flat-swatch.selected { border-color: var(--ink); box-shadow: 0 0 0 1.5px var(--ink), 0 0 0 3px var(--paper), 0 0 0 4.5px var(--ink); transform: scale(1.1); }
+.flat-swatch-none {
+  width: 18px; height: 18px; border-radius: 3px; cursor: pointer; flex-shrink: 0;
+  border: 1.5px solid var(--line); display: flex; align-items: center; justify-content: center;
+  font-size: 10px; color: var(--muted); transition: all 0.1s ease; background: var(--paper);
+}
+.flat-swatch-none:hover { border-color: var(--accent); color: var(--accent); }
+
 .conti-empty {
   padding: 18px 12px; text-align: center; font-size: 12px; color: var(--muted);
   border: 1px dashed var(--line); border-radius: 5px;
@@ -2391,13 +2455,16 @@ const FrameView = forwardRef(function FrameView({
           const ml = b.type === 'cut' ? (b.marginLeft ?? frame.sideMargin) : 0;
           const mr = b.type === 'cut' ? (b.marginRight ?? frame.sideMargin) : 0;
           const bw = b.type === 'cut' ? Math.max(10, frame.canvasWidth - ml - mr) : frame.canvasWidth;
-          const bg = b.gradient ? gradientToCss(b.gradient, bw, b.height) : null;
+          const gradCss = b.gradient ? gradientToCss(b.gradient, bw, b.height) : null;
+          const flatRgb = b.flatColor != null ? grayToRgbStr(b.flatColor) : null;
+          const blockStyle = {
+            top: `${b.top}px`, left: `${ml}px`, width: `${bw}px`, height: `${b.height}px`,
+          };
+          if (flatRgb) blockStyle.backgroundColor = flatRgb;
+          if (gradCss) blockStyle.backgroundImage = gradCss;
           return (
-            <div key={b.id} className={`conti-block ${b.type}${b.gradient ? ' has-gradient' : ''}`}
-              style={{
-                top: `${b.top}px`, left: `${ml}px`, width: `${bw}px`, height: `${b.height}px`,
-                ...(bg ? { background: bg } : null),
-              }} />
+            <div key={b.id} className={`conti-block ${b.type}${b.gradient ? ' has-gradient' : ''}${b.flatColor != null ? ' has-flat-color' : ''}`}
+              style={blockStyle} />
           );
         })}
         <canvas ref={canvasRef} className="conti-frame-canvas" style={{ touchAction: 'none' }} onContextMenu={e => e.preventDefault()} />
@@ -2765,6 +2832,10 @@ export default function ContiProgram() {
   // refs needed by gradient handle move (avoid stale closures)
   const framesRef = useRef(frames);
   useEffect(() => { framesRef.current = frames; }, [frames]);
+
+  // ---------- flat color editing ----------
+  // editingFlatColorBlockId: id of the block currently showing the flat-color swatch picker. null = none.
+  const [editingFlatColorBlockId, setEditingFlatColorBlockId] = useState(null);
 
   // ---------- layer-row drag ----------
   const [layerDragId, setLayerDragId] = useState(null);
@@ -4174,13 +4245,10 @@ export default function ContiProgram() {
   const swapGradientEnds = useCallback((blockId) => {
     mutateBlockGradient(blockId, g => {
       if (!g) return g;
-      return {
-        ...g,
-        start: g.end,
-        end: g.start,
-        // also mirror stops so the visual gradient stays the same direction
-        stops: g.stops.map(s => ({ ...s, offset: 1 - s.offset })).sort((a, b) => a.offset - b.offset),
-      };
+      // stop offset은 start→end 방향 기준 상대좌표이므로
+      // start/end만 바꾸면 방향이 뒤집혀 그라데이션이 반전된다.
+      // stop도 동시에 미러링하면 효과가 상쇄되므로 건드리지 않는다.
+      return { ...g, start: g.end, end: g.start };
     });
   }, [mutateBlockGradient]);
 
@@ -4247,6 +4315,33 @@ export default function ContiProgram() {
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
   }, [editingGradientBlockId]);
+
+  // ===================================================================
+  //  FLAT COLOR — per-block solid grayscale fill
+  //  value = 0..255 grayscale (null = no fill)
+  // ===================================================================
+  const setBlockFlatColor = useCallback((blockId, value) => {
+    setFrames(arr => arr.map(f => f.id !== selectedFrameId ? f : ({
+      ...f, blocks: f.blocks.map(b => b.id !== blockId ? b : { ...b, flatColor: value }),
+    })));
+    requestAutosaveRef.current?.();
+  }, [selectedFrameId]);
+
+  const removeBlockFlatColor = useCallback((blockId) => {
+    setFrames(arr => arr.map(f => f.id !== selectedFrameId ? f : ({
+      ...f, blocks: f.blocks.map(b => {
+        if (b.id !== blockId) return b;
+        const { flatColor, ...rest } = b;
+        return rest;
+      }),
+    })));
+    setEditingFlatColorBlockId(curr => curr === blockId ? null : curr);
+    requestAutosaveRef.current?.();
+  }, [selectedFrameId]);
+
+  const toggleEditFlatColor = useCallback((blockId) => {
+    setEditingFlatColorBlockId(curr => curr === blockId ? null : blockId);
+  }, []);
 
   // ===================================================================
   //  Viewport-center block tracking
@@ -5365,10 +5460,13 @@ export default function ContiProgram() {
                   const showBelow = dragOverId === b.id && dragOverPos === 'below' && dragId !== b.id;
                   const isCut = b.type === 'cut';
                   const isEditingGrad = editingGradientBlockId === b.id;
+                  const isEditingFlat = editingFlatColorBlockId === b.id;
                   const hasGrad = !!b.gradient;
+                  const hasFlatColor = b.flatColor != null;
                   // attach-bottom: row should have flat bottom because another row sits directly under it
-                  const mainAttachBottom = isCut || isEditingGrad;
-                  const marginAttachBottom = isCut && isEditingGrad;
+                  const anySubRow = isCut || isEditingGrad || isEditingFlat;
+                  const mainAttachBottom = anySubRow;
+                  const marginAttachBottom = isCut && (isEditingGrad || isEditingFlat);
                   return (
                     <div key={b.id} data-block-id={b.id}>
                       {showAbove && <div style={{ position:'relative',height:3,background:'var(--accent)',borderRadius:2,margin:'0 0 2px 0' }} />}
@@ -5399,6 +5497,15 @@ export default function ContiProgram() {
                             onClick={() => updateBlockHeight(b.id, String(b.height - 50))}>▼</button>
                         </div>
                         <span className="conti-tool-unit mono">px</span>
+                        {/* flat color button */}
+                        <button
+                          className={`block-flat-btn${hasFlatColor ? ' has' : ''}${isEditingFlat ? ' editing' : ''}`}
+                          title={hasFlatColor ? (isEditingFlat ? '색상 편집 닫기' : '색상 편집') : '배경색 추가'}
+                          onClick={() => toggleEditFlatColor(b.id)}
+                          style={hasFlatColor ? { background: grayToRgbStr(b.flatColor), border: '1.5px solid rgba(0,0,0,0.22)' } : null}
+                        >
+                          {hasFlatColor ? '' : 'C'}
+                        </button>
                         <button
                           className={`block-grad-btn${hasGrad ? ' has' : ''}${isEditingGrad ? ' editing' : ''}`}
                           title={hasGrad ? (isEditingGrad ? '그라데이션 편집 닫기' : '그라데이션 편집') : '그라데이션 추가'}
@@ -5420,6 +5527,27 @@ export default function ContiProgram() {
                             value={b.marginRight ?? selectedFrame.sideMargin}
                             onChange={e => updateBlockMargin(b.id, 'marginRight', e.target.value)} />
                           <span className="conti-margin-label">R</span>
+                        </div>
+                      )}
+                      {isEditingFlat && (
+                        <div className={`conti-block-flat-row${b.id === activeBlockId ? ' viewport-active' : ''}`}>
+                          <span className="flat-color-label">COLOR</span>
+                          {FLAT_COLOR_STEPS.map(step => (
+                            <div
+                              key={step.hex}
+                              className={`flat-swatch${b.flatColor === step.value ? ' selected' : ''}`}
+                              style={{ background: `#${step.hex}` }}
+                              title={`#${step.hex}`}
+                              onClick={() => setBlockFlatColor(b.id, step.value)}
+                            />
+                          ))}
+                          {hasFlatColor && (
+                            <div
+                              className="flat-swatch-none"
+                              title="색상 제거"
+                              onClick={() => removeBlockFlatColor(b.id)}
+                            >✕</div>
+                          )}
                         </div>
                       )}
                       {isEditingGrad && b.gradient && (
