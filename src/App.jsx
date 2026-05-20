@@ -2734,6 +2734,10 @@ const FrameView = forwardRef(function FrameView({
             if (isVectorActive) onBubbleOverlayPointerUp(e, frame.id, overlayRef.current);
             else onPointerUp(e, overlayRef.current);
           }}
+          onLostPointerCapture={e => {
+            if (isVectorActive) onBubbleOverlayPointerUp(e, frame.id, overlayRef.current);
+            else onPointerUp(e, overlayRef.current);
+          }}
           onPointerLeave={e => {
             const oc = overlayRef.current;
             if (oc?.hasPointerCapture?.(e.pointerId)) return;
@@ -4141,6 +4145,52 @@ export default function ContiProgram() {
     queueLiveStrokeOverlay(draw, newPoints);
   };
 
+  const commitPendingStroke = (reason = 'manual') => {
+    const drawState = drawingRef.current;
+    const liveStroke = currentStrokeRef.current;
+    if (drawState?.liveRafId) { cancelAnimationFrame(drawState.liveRafId); flushLiveStrokeOverlay(drawState); }
+    else flushLiveStrokeOverlay(drawState);
+    drawingRef.current = null;
+    currentStrokeRef.current = null;
+    if (!drawState || !liveStroke || liveStroke.points.length === 0) return false;
+
+    const frame = frames.find(f => f.id === drawState.frameId) || drawState.frame;
+    if (!frame) return false;
+    const fref = frameRefs.current[drawState.frameId];
+    const tops = computeBlockTops(frame.blocks);
+    const ownerId = findStrokeBlockId(liveStroke, frame.blocks, tops);
+    if (ownerId == null) {
+      fref?.clearOverlay();
+      return false;
+    }
+    const ownerBlock = frame.blocks.find(b => b.id === ownerId);
+    if (!ownerBlock) {
+      fref?.clearOverlay();
+      return false;
+    }
+    const ownerTop = tops[ownerId];
+    const localPoints = liveStroke.points.map(p => ({ x: p.x, y: p.y - ownerTop }));
+    const simplified = rdpSimplify(localPoints, RDP_EPSILON);
+    const stored = {
+      points: simplified,
+      size: liveStroke.size,
+      opacity: liveStroke.opacity,
+      color: liveStroke.color,
+      bbox: computeBbox(simplified),
+      hidden: false,
+    };
+    const store = ensureLayerStore(drawState.frameId, drawState.layerId);
+    if (!store.byBlock[ownerId]) store.byBlock[ownerId] = [];
+    store.byBlock[ownerId].push(stored);
+    store.history.push({ layerId: drawState.layerId, blockId: ownerId, source: reason });
+    const entry = ensureBlockBitmap(drawState.frameId, drawState.layerId, ownerBlock, frame.canvasWidth, stored.bbox.maxY);
+    renderStrokeToCtx(entry.ctx, stored, BITMAP_Y_PADDING);
+    fref?.redraw();
+    fref?.clearOverlay();
+    requestAutosaveRef.current?.();
+    return true;
+  };
+
   const handlePointerUp = (e, overlayEl) => {
     if (activeTool === 'lasso') { handleLassoPointerUp(e, overlayEl); return; }
     if (activeTool === 'eraser') {
@@ -4183,39 +4233,7 @@ export default function ContiProgram() {
       if (e.pointerType === 'touch') activeTouchPointersRef.current.delete(e.pointerId);
       return;
     }
-    const drawState = drawingRef.current, liveStroke = currentStrokeRef.current;
-    if (drawState?.liveRafId) { cancelAnimationFrame(drawState.liveRafId); flushLiveStrokeOverlay(drawState); }
-    else flushLiveStrokeOverlay(drawState);
-    drawingRef.current = null; currentStrokeRef.current = null;
-    if (!drawState || !liveStroke || liveStroke.points.length === 0) return;
-    const frame = frames.find(f => f.id === drawState.frameId);
-    if (!frame) return;
-    const fref = frameRefs.current[drawState.frameId];
-    const tops = computeBlockTops(frame.blocks);
-    const ownerId = findStrokeBlockId(liveStroke, frame.blocks, tops);
-    if (ownerId == null) {
-      // stroke 가 어떤 block 에도 속하지 않으면 버린다.
-      // overlay 의 live preview 도 같이 지워줘야 한다 (안 그러면 잔상이 남는다).
-      fref?.clearOverlay();
-      return;
-    }
-    const ownerBlock = frame.blocks.find(b => b.id === ownerId);
-    const ownerTop = tops[ownerId];
-    const localPoints = liveStroke.points.map(p => ({ x: p.x, y: p.y - ownerTop }));
-    const simplified = rdpSimplify(localPoints, RDP_EPSILON);
-    const stored = { points: simplified, size: liveStroke.size, opacity: liveStroke.opacity, color: liveStroke.color, bbox: computeBbox(simplified), hidden: false };
-    const store = ensureLayerStore(drawState.frameId, drawState.layerId);
-    if (!store.byBlock[ownerId]) store.byBlock[ownerId] = [];
-    store.byBlock[ownerId].push(stored);
-    store.history.push({ layerId: drawState.layerId, blockId: ownerId });
-    const entry = ensureBlockBitmap(drawState.frameId, drawState.layerId, ownerBlock, frame.canvasWidth, stored.bbox.maxY);
-    renderStrokeToCtx(entry.ctx, stored, BITMAP_Y_PADDING);
-    // ── stroke 가 bitmap 에 커밋됐으니 이제 main canvas 를 딱 한 번 다시 그린다.
-    //    그리고 overlay 의 live preview 를 지운다. 순서가 중요: main 먼저 그려서
-    //    동일한 stroke 가 main 에 나타난 후에 overlay 를 지워야 깜빡임 없다.
-    fref?.redraw();
-    fref?.clearOverlay();
-    requestAutosave();
+    commitPendingStroke('pointerup');
   };
 
   // ===================================================================
@@ -4378,23 +4396,47 @@ export default function ContiProgram() {
   // ===================================================================
   //  Block management
   // ===================================================================
+  const settleCanvasInteraction = (reason = 'before-layout-change') => {
+    commitPendingStroke(reason);
+    const lasso = lassoRef.current;
+    if (lasso.frameId && lasso.phase !== 'idle') {
+      const fr = frames.find(f => f.id === lasso.frameId);
+      if (['selected','dragging','resizing','rotating'].includes(lasso.phase)) {
+        if (fr) applyLassoSelection(lasso.frameId, fr);
+      } else if (fr) {
+        cancelLassoSelection(lasso.frameId, fr);
+      }
+    }
+  };
+
+  const redrawSelectedFrameSoon = () => {
+    setTimeout(() => frameRefs.current[selectedFrameId]?.redraw(), 0);
+  };
+
   const addCut = height => {
     if (!selectedFrame) return;
+    settleCanvasInteraction('before-add-cut');
     const sm = selectedFrame.sideMargin;
     setFrames(arr => arr.map(f => f.id === selectedFrameId
       ? { ...f, blocks: [...f.blocks, { id: newId(), type: 'cut', height, marginLeft: sm, marginRight: sm }] }
       : f));
+    redrawSelectedFrameSoon();
+    requestAutosaveRef.current?.();
   };
 
   const addGap = height => {
     if (!selectedFrame) return;
+    settleCanvasInteraction('before-add-gap');
     setFrames(arr => arr.map(f => f.id === selectedFrameId
       ? { ...f, blocks: [...f.blocks, { id: newId(), type: 'gap', height }] }
       : f));
+    redrawSelectedFrameSoon();
+    requestAutosaveRef.current?.();
   };
 
   const removeBlock = blockId => {
     if (!selectedFrame) return;
+    settleCanvasInteraction('before-remove-block');
     const oldTops = computeBlockTops(selectedFrame.blocks);
     const removedBlock = selectedFrame.blocks.find(b => b.id === blockId);
     const removedTop = oldTops[blockId] ?? 0;
@@ -4429,6 +4471,7 @@ export default function ContiProgram() {
 
   const updateBlockHeight = (blockId, value) => {
     if (!selectedFrame) return;
+    settleCanvasInteraction('before-update-block-height');
     const h = Math.max(50, Math.min(5000, parseInt(value, 10) || 200));
     const target = selectedFrame.blocks.find(b => b.id === blockId);
     if (!target || target.height === h) return;
@@ -4464,6 +4507,7 @@ export default function ContiProgram() {
 
   const updateBlockMargin = (blockId, side, value) => {
     if (!selectedFrame) return;
+    settleCanvasInteraction('before-update-block-margin');
     const v = Math.max(0, Math.min(500, parseInt(value, 10)));
     if (!Number.isFinite(v)) return;
     setFrames(arr => arr.map(f => f.id === selectedFrameId
