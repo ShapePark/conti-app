@@ -605,6 +605,23 @@ const renderStrokeToCtx = (ctx, stroke, yShift = 0) => {
   ctx.stroke();
 };
 
+// 진행 중인 stroke 를 overlay canvas 에 그린다.
+// overlay 는 main canvas 위에 위치해서, 시각적으로는 동일하게 보이지만
+// main canvas 자체 (= 모든 block bitmap blit 결과) 를 매 pointermove 마다
+// 다시 그리지 않아도 되는 게 핵심이다.
+const renderLiveStrokeToOverlay = (oc, dpr, stroke) => {
+  if (!oc) return;
+  const ctx = oc.getContext('2d');
+  // overlay 전체 clear (cheap — overlay 는 거의 비어있음)
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.clearRect(0, 0, oc.width, oc.height);
+  // logical 좌표계로 전환
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.lineCap = 'round';
+  ctx.lineJoin = 'round';
+  renderStrokeToCtx(ctx, stroke, 0);
+};
+
 const createBlockBitmap = (logicalWidth, logicalHeight, dpr) => {
   const canvas = document.createElement('canvas');
   canvas.width = Math.max(1, Math.ceil(logicalWidth * dpr));
@@ -3882,20 +3899,25 @@ export default function ContiProgram() {
       if (!activeLayerId) return;
       try { overlayEl.setPointerCapture(e.pointerId); } catch(_) {}
       const p = getCanvasPoint(e, overlayEl, frame);
-      drawingRef.current = { frameId, layerId: activeLayerId };
+      // pointermove 마다 frames.find / blocks.reduce 다시 안 하도록 캐싱
+      const fref = frameRefs.current[frameId];
+      drawingRef.current = { frameId, layerId: activeLayerId, frame, dpr: fref?.getDpr() || 1 };
       currentStrokeRef.current = { points: [p], size: penSize, opacity: penOpacity / 100, color: penColor };
-      const mc = frameRefs.current[frameId]?.getMainCanvas();
-      if (mc) {
-        const ctx = mc.getContext('2d');
-        ctx.fillStyle = hexToRgba(penColor, penOpacity / 100);
-        ctx.beginPath(); ctx.arc(p.x, p.y, penSize/2, 0, Math.PI*2); ctx.fill();
-      }
+      // 시작점 dot 을 overlay 에 (main canvas 는 건드리지 않음)
+      renderLiveStrokeToOverlay(overlayEl, drawingRef.current.dpr, currentStrokeRef.current);
       return;
     }
     if (e.pointerType === 'touch') {
       activeTouchPointersRef.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
       if (activeTouchPointersRef.current.size >= 2) {
-        if (drawingRef.current) { const cid = drawingRef.current.frameId; drawingRef.current = null; currentStrokeRef.current = null; frameRefs.current[cid]?.redraw(); }
+        if (drawingRef.current) {
+          // 그리는 도중 두번째 손가락이 닿으면 pan 모드로 전환된다.
+          // 진행 중이던 live stroke 는 버리고, overlay 만 지우면 된다.
+          // (main canvas 는 그리는 동안 건드린 적이 없으므로 redraw 불필요)
+          const cid = drawingRef.current.frameId;
+          drawingRef.current = null; currentStrokeRef.current = null;
+          frameRefs.current[cid]?.clearOverlay();
+        }
         if (!panStateRef.current) {
           const pts = [...activeTouchPointersRef.current.values()];
           panStateRef.current = { lastX: pts.reduce((s,p)=>s+p.x,0)/pts.length, lastY: pts.reduce((s,p)=>s+p.y,0)/pts.length };
@@ -3918,14 +3940,10 @@ export default function ContiProgram() {
     if (!activeLayerId) return;
     try { overlayEl.setPointerCapture(e.pointerId); } catch(_) {}
     const p = getCanvasPoint(e, overlayEl, frame);
-    drawingRef.current = { frameId, layerId: activeLayerId };
+    const fref = frameRefs.current[frameId];
+    drawingRef.current = { frameId, layerId: activeLayerId, frame, dpr: fref?.getDpr() || 1 };
     currentStrokeRef.current = { points: [p], size: penSize, opacity: penOpacity / 100, color: penColor };
-    const mc = frameRefs.current[frameId]?.getMainCanvas();
-    if (mc) {
-      const ctx = mc.getContext('2d');
-      ctx.fillStyle = hexToRgba(penColor, penOpacity / 100);
-      ctx.beginPath(); ctx.arc(p.x, p.y, penSize/2, 0, Math.PI*2); ctx.fill();
-    }
+    renderLiveStrokeToOverlay(overlayEl, drawingRef.current.dpr, currentStrokeRef.current);
   };
 
   const handlePointerMove = (e, overlayEl) => {
@@ -3996,7 +4014,9 @@ export default function ContiProgram() {
     }
     if (!drawingRef.current || !overlayEl) return;
     e.preventDefault();
-    const frame = frames.find(f => f.id === drawingRef.current.frameId);
+    // drawingRef 에 캐싱해 둔 frame/dpr 을 그대로 사용 (frames.find / blocks.reduce 안 함)
+    const draw = drawingRef.current;
+    const frame = draw.frame;
     if (!frame) return;
 
     // ─── Apple Pencil 고해상도 입력 보정 ─────────────────────────────
@@ -4018,15 +4038,19 @@ export default function ContiProgram() {
       s.points.push(p);
     }
 
-    // 커밋된 비트맵을 다시 그린 뒤, 현재 stroke 전체를 하나의 path로 그린다.
-    // (세그먼트별 개별 stroke() 방식은 round cap 겹침으로 불투명도가 중첩돼
-    //  원들이 보이는 문제가 생기므로, 전체 경로를 단일 stroke()로 처리한다.)
-    const fref = frameRefs.current[drawingRef.current.frameId];
-    if (fref) {
-      fref.redraw();
-      const mc = fref.getMainCanvas();
-      if (mc) renderStrokeToCtx(mc.getContext('2d'), s, 0);
-    }
+    // ── 핵심 성능 개선 ─────────────────────────────────────────────
+    // 이전 버전은 매 pointermove 마다 fref.redraw() 로 모든 layer × 모든
+    // block 의 bitmap 을 다시 blit 했다. 690×4500 캔버스에 cut 4개 + 2개
+    // 레이어면 회당 ~25M 픽셀 compositing → 60Hz 면 초당 1.5GB. iPad
+    // 가 못 따라가서 stroke 가 안 그려지고 버벅이는 원인.
+    //
+    // 해결: 그리는 동안은 main canvas 를 절대 건드리지 않는다. live stroke
+    // 는 그 위에 떠 있는 overlay 에만 그린다. main 은 pointerup 에서 stroke
+    // 가 bitmap 에 커밋된 후 딱 한 번만 redraw 한다.
+    //
+    // overlay 는 매번 clear 후 단일 path 로 stroke 전체를 그리므로 round-cap
+    // 겹침에 의한 opacity 누적 문제도 그대로 없다.
+    renderLiveStrokeToOverlay(overlayEl, draw.dpr, s);
   };
 
   const handlePointerUp = (e, overlayEl) => {
@@ -4072,9 +4096,15 @@ export default function ContiProgram() {
     if (!drawState || !liveStroke || liveStroke.points.length === 0) return;
     const frame = frames.find(f => f.id === drawState.frameId);
     if (!frame) return;
+    const fref = frameRefs.current[drawState.frameId];
     const tops = computeBlockTops(frame.blocks);
     const ownerId = findStrokeBlockId(liveStroke, frame.blocks, tops);
-    if (ownerId == null) { frameRefs.current[drawState.frameId]?.redraw(); return; }
+    if (ownerId == null) {
+      // stroke 가 어떤 block 에도 속하지 않으면 버린다.
+      // overlay 의 live preview 도 같이 지워줘야 한다 (안 그러면 잔상이 남는다).
+      fref?.clearOverlay();
+      return;
+    }
     const ownerBlock = frame.blocks.find(b => b.id === ownerId);
     const ownerTop = tops[ownerId];
     const localPoints = liveStroke.points.map(p => ({ x: p.x, y: p.y - ownerTop }));
@@ -4086,6 +4116,11 @@ export default function ContiProgram() {
     store.history.push({ layerId: drawState.layerId, blockId: ownerId });
     const entry = ensureBlockBitmap(drawState.frameId, drawState.layerId, ownerBlock, frame.canvasWidth, stored.bbox.maxY);
     renderStrokeToCtx(entry.ctx, stored, BITMAP_Y_PADDING);
+    // ── stroke 가 bitmap 에 커밋됐으니 이제 main canvas 를 딱 한 번 다시 그린다.
+    //    그리고 overlay 의 live preview 를 지운다. 순서가 중요: main 먼저 그려서
+    //    동일한 stroke 가 main 에 나타난 후에 overlay 를 지워야 깜빡임 없다.
+    fref?.redraw();
+    fref?.clearOverlay();
     requestAutosave();
   };
 
