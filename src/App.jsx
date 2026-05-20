@@ -22,6 +22,9 @@ const CUT_STROKE_HALO = 200;
 const BITMAP_Y_PADDING = 200;
 const BITMAP_GROW_CHUNK = 400;
 const DPR_CAP = 2;
+const SAFE_CANVAS_MAX_AREA = 16_000_000; // iOS/Safari 계열에서 큰 canvas가 빈 화면이 되는 것을 막기 위한 보수적 한계
+const SAFE_CANVAS_MAX_SIDE = 16_000;
+const MAX_FRAME_HEIGHT = 30_000;
 const RDP_EPSILON = 0.5;
 
 // ---------- lasso constants ----------
@@ -53,6 +56,31 @@ const computeBlockTops = (arr) => {
   let y = 0;
   for (const b of arr) { tops[b.id] = y; y += b.height; }
   return tops;
+};
+
+const getFrameTotalHeight = (blocks = []) =>
+  blocks.reduce((sum, b) => sum + (Number.isFinite(b?.height) ? b.height : 0), 0);
+
+const getSafeCanvasDpr = (logicalWidth, logicalHeight, preferredDpr = 1) => {
+  const w = Math.max(1, Number(logicalWidth) || 1);
+  const h = Math.max(1, Number(logicalHeight) || 1);
+  const preferred = Math.max(0.1, Number(preferredDpr) || 1);
+  const byArea = Math.sqrt(SAFE_CANVAS_MAX_AREA / (w * h));
+  const bySide = SAFE_CANVAS_MAX_SIDE / Math.max(w, h);
+  return Math.max(0.1, Math.min(preferred, byArea, bySide));
+};
+
+const clampFrameAddedHeight = (frame, requestedHeight) => {
+  const requested = Math.max(50, Math.round(Number(requestedHeight) || 0));
+  const used = getFrameTotalHeight(frame?.blocks || []);
+  return Math.max(0, Math.min(requested, MAX_FRAME_HEIGHT - used));
+};
+
+const clampBlockHeightForFrame = (frame, blockId, requestedHeight) => {
+  const requested = Math.max(50, Math.round(Number(requestedHeight) || 200));
+  const current = frame?.blocks?.find(b => b.id === blockId)?.height ?? 0;
+  const otherTotal = getFrameTotalHeight(frame?.blocks || []) - current;
+  return Math.max(50, Math.min(requested, 5000, MAX_FRAME_HEIGHT - otherTotal));
 };
 
 const findStrokeBlockId = (stroke, arr, tops) => {
@@ -519,6 +547,7 @@ const validatePayload = (data) => {
   for (const f of data.frames) {
     if (typeof f.id !== 'number') return { ok: false, error: 'frame id 가 잘못되었습니다' };
     if (!Array.isArray(f.blocks) || !Array.isArray(f.layers)) return { ok: false, error: 'frame 구조가 잘못되었습니다' };
+    if (getFrameTotalHeight(f.blocks) > MAX_FRAME_HEIGHT) return { ok: false, error: `frame height는 최대 ${MAX_FRAME_HEIGHT.toLocaleString()}px까지 지원합니다` };
   }
   return { ok: true };
 };
@@ -690,13 +719,14 @@ const queueLiveStrokeOverlay = (drawState, points) => {
 };
 
 const createBlockBitmap = (logicalWidth, logicalHeight, dpr) => {
+  const safeDpr = getSafeCanvasDpr(logicalWidth, logicalHeight, dpr);
   const canvas = document.createElement('canvas');
-  canvas.width = Math.max(1, Math.ceil(logicalWidth * dpr));
-  canvas.height = Math.max(1, Math.ceil(logicalHeight * dpr));
+  canvas.width = Math.max(1, Math.ceil(logicalWidth * safeDpr));
+  canvas.height = Math.max(1, Math.ceil(logicalHeight * safeDpr));
   const ctx = canvas.getContext('2d');
-  ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.scale(dpr, dpr);
+  ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.scale(safeDpr, safeDpr);
   ctx.lineCap = 'round'; ctx.lineJoin = 'round';
-  return { canvas, ctx, logicalWidth, logicalHeight, dpr };
+  return { canvas, ctx, logicalWidth, logicalHeight, dpr: safeDpr };
 };
 
 const blitBitmap = (srcEntry, dstCtx) =>
@@ -2568,7 +2598,7 @@ const FrameView = React.memo(forwardRef(function FrameView({
   const overlayRef = useRef(null);
   const dprRef = useRef(1);
 
-  const totalHeight = useMemo(() => frame.blocks.reduce((s, b) => s + b.height, 0), [frame.blocks]);
+  const totalHeight = useMemo(() => getFrameTotalHeight(frame.blocks), [frame.blocks]);
 
   const blockLayout = useMemo(() => {
     let y = 0, cutCounter = 0, gapCounter = 0;
@@ -2581,29 +2611,58 @@ const FrameView = React.memo(forwardRef(function FrameView({
     });
   }, [frame.blocks]);
 
-  const redraw = useCallback(() => {
+  const redrawRegion = useCallback((region = null) => {
     const c = canvasRef.current;
     if (!c) return;
     const ctx = c.getContext('2d');
-    const dpr = dprRef.current;
-    ctx.clearRect(0, 0, c.width / dpr, c.height / dpr);
+    const dpr = dprRef.current || 1;
+    const canvasW = c.width / dpr;
+    const canvasH = c.height / dpr;
+
+    const rx = region ? Math.max(0, Math.floor(region.x || 0)) : 0;
+    const ry = region ? Math.max(0, Math.floor(region.y || 0)) : 0;
+    const rw = region ? Math.min(canvasW - rx, Math.ceil(region.w || 0)) : canvasW;
+    const rh = region ? Math.min(canvasH - ry, Math.ceil(region.h || 0)) : canvasH;
+    if (rw <= 0 || rh <= 0) return;
+
+    ctx.clearRect(rx, ry, rw, rh);
+
     for (const layer of frame.layers) {
       if (!layer.visible || layer.type !== 'raster') continue;
       ctx.save();
       ctx.globalAlpha = layer.opacity / 100;
-      let y = 0;
-      for (const b of frame.blocks) {
+      for (const b of blockLayout) {
         const entry = getLayerBitmap(frame.id, layer.id, b.id);
-        if (entry) ctx.drawImage(entry.canvas, 0, 0, entry.canvas.width, entry.canvas.height,
-          0, y - BITMAP_Y_PADDING, entry.logicalWidth, entry.logicalHeight);
-        y += b.height;
+        if (!entry?.canvas) continue;
+
+        const dstX = 0;
+        const dstY = b.top - BITMAP_Y_PADDING;
+        const dstW = entry.logicalWidth;
+        const dstH = entry.logicalHeight;
+
+        const ox = Math.max(rx, dstX);
+        const oy = Math.max(ry, dstY);
+        const ox2 = Math.min(rx + rw, dstX + dstW);
+        const oy2 = Math.min(ry + rh, dstY + dstH);
+        if (ox2 <= ox || oy2 <= oy) continue;
+
+        const sourceScaleX = entry.canvas.width / dstW;
+        const sourceScaleY = entry.canvas.height / dstH;
+        const sx = (ox - dstX) * sourceScaleX;
+        const sy = (oy - dstY) * sourceScaleY;
+        const sw = (ox2 - ox) * sourceScaleX;
+        const sh = (oy2 - oy) * sourceScaleY;
+
+        ctx.drawImage(entry.canvas, sx, sy, sw, sh, ox, oy, ox2 - ox, oy2 - oy);
       }
       ctx.restore();
     }
-  }, [frame.blocks, frame.layers, getLayerBitmap]);
+  }, [blockLayout, frame.id, frame.layers, getLayerBitmap]);
+
+  const redraw = useCallback(() => redrawRegion(null), [redrawRegion]);
 
   useLayoutEffect(() => {
-    const dpr = Math.min(window.devicePixelRatio || 1, DPR_CAP);
+    const dpr = getSafeCanvasDpr(frame.canvasWidth, totalHeight, Math.min(window.devicePixelRatio || 1, DPR_CAP));
     dprRef.current = dpr;
     const c = canvasRef.current;
     if (c) {
@@ -2672,6 +2731,7 @@ const FrameView = React.memo(forwardRef(function FrameView({
 
   useImperativeHandle(ref, () => ({
     redraw,
+    redrawRegion,
     getMainCanvas: () => canvasRef.current,
     getOverlayCanvas: () => overlayRef.current,
     getDpr: () => dprRef.current,
@@ -2680,7 +2740,7 @@ const FrameView = React.memo(forwardRef(function FrameView({
       if (!oc) return;
       clearLiveStrokeOverlay(oc);
     },
-  }), [redraw]);
+  }), [redraw, redrawRegion]);
 
   const isActiveFrame = isSelected;
   const fActiveLayer = frame.layers.find(l => l.id === frame.activeLayerId);
@@ -3014,16 +3074,16 @@ export default function ContiProgram() {
   }, []);
 
   // ---------- bitmap management ----------
-  const getBitmapDpr = useCallback(() => Math.min(window.devicePixelRatio || 1, DPR_CAP), []);
+  const getBitmapDpr = useCallback((logicalWidth, logicalHeight) => getSafeCanvasDpr(logicalWidth, logicalHeight, Math.min(window.devicePixelRatio || 1, DPR_CAP)), []);
 
   const ensureBlockBitmap = useCallback((frameId, layerId, block, frameWidth, neededLocalMaxY) => {
     const store = ensureLayerStore(frameId, layerId);
-    const dpr = getBitmapDpr();
     const required = Math.max(block.height, neededLocalMaxY ?? 0) + 2 * BITMAP_Y_PADDING;
     const targetH = Math.ceil(required / BITMAP_GROW_CHUNK) * BITMAP_GROW_CHUNK;
+    const dpr = getBitmapDpr(frameWidth, targetH);
     let entry = store.bitmaps[block.id];
     if (!entry) { entry = createBlockBitmap(frameWidth, targetH, dpr); store.bitmaps[block.id] = entry; }
-    else if (entry.logicalWidth !== frameWidth || entry.logicalHeight < required) {
+    else if (entry.logicalWidth !== frameWidth || entry.logicalHeight < required || Math.abs((entry.dpr || 1) - dpr) > 0.001) {
       const next = createBlockBitmap(frameWidth, Math.max(targetH, entry.logicalHeight), dpr);
       blitBitmap(entry, next.ctx); store.bitmaps[block.id] = next; entry = next;
     }
@@ -4221,9 +4281,15 @@ export default function ContiProgram() {
     store.history.push({ layerId: drawState.layerId, blockId: ownerId, source: reason });
     const entry = ensureBlockBitmap(drawState.frameId, drawState.layerId, ownerBlock, frame.canvasWidth, stored.bbox.maxY);
     renderStrokeToCtx(entry.ctx, stored, BITMAP_Y_PADDING);
-    fref?.redraw();
+    const dirtyPad = Math.max(8, stored.size + 6);
+    fref?.redrawRegion?.({
+      x: stored.bbox.minX - dirtyPad,
+      y: ownerTop + stored.bbox.minY - dirtyPad,
+      w: (stored.bbox.maxX - stored.bbox.minX) + dirtyPad * 2,
+      h: (stored.bbox.maxY - stored.bbox.minY) + dirtyPad * 2,
+    });
     fref?.clearOverlay();
-    setStrokeAutosaveTick(t => t + 1);
+    requestAutosaveRef.current?.();
     return true;
   };
 
@@ -4450,10 +4516,12 @@ export default function ContiProgram() {
 
   const addCut = height => {
     if (!selectedFrame) return;
+    const nextHeight = clampFrameAddedHeight(selectedFrame, height);
+    if (nextHeight <= 0) { window.alert(`한 frame의 최대 height는 ${MAX_FRAME_HEIGHT.toLocaleString()}px입니다.`); return; }
     settleCanvasInteraction('before-add-cut');
     const sm = selectedFrame.sideMargin;
     setFrames(arr => arr.map(f => f.id === selectedFrameId
-      ? { ...f, blocks: [...f.blocks, { id: newId(), type: 'cut', height, marginLeft: sm, marginRight: sm }] }
+      ? { ...f, blocks: [...f.blocks, { id: newId(), type: 'cut', height: nextHeight, marginLeft: sm, marginRight: sm }] }
       : f));
     redrawSelectedFrameSoon();
     requestAutosaveRef.current?.();
@@ -4461,9 +4529,11 @@ export default function ContiProgram() {
 
   const addGap = height => {
     if (!selectedFrame) return;
+    const nextHeight = clampFrameAddedHeight(selectedFrame, height);
+    if (nextHeight <= 0) { window.alert(`한 frame의 최대 height는 ${MAX_FRAME_HEIGHT.toLocaleString()}px입니다.`); return; }
     settleCanvasInteraction('before-add-gap');
     setFrames(arr => arr.map(f => f.id === selectedFrameId
-      ? { ...f, blocks: [...f.blocks, { id: newId(), type: 'gap', height }] }
+      ? { ...f, blocks: [...f.blocks, { id: newId(), type: 'gap', height: nextHeight }] }
       : f));
     redrawSelectedFrameSoon();
     requestAutosaveRef.current?.();
@@ -4507,7 +4577,7 @@ export default function ContiProgram() {
   const updateBlockHeight = (blockId, value) => {
     if (!selectedFrame) return;
     settleCanvasInteraction('before-update-block-height');
-    const h = Math.max(50, Math.min(5000, parseInt(value, 10) || 200));
+    const h = clampBlockHeightForFrame(selectedFrame, blockId, parseInt(value, 10) || 200);
     const target = selectedFrame.blocks.find(b => b.id === blockId);
     if (!target || target.height === h) return;
 
@@ -5106,7 +5176,7 @@ export default function ContiProgram() {
   // 자동 저장 트리거 (디바운스)
   const requestAutosave = useCallback(() => {
     if (autosaveLockRef.current) return;
-    setSaveStatus('dirty');
+    setSaveStatus(prev => prev === 'dirty' ? prev : 'dirty');
     if (autosaveTimerRef.current) clearTimeout(autosaveTimerRef.current);
     if (autosaveIdleRef.current != null && window.cancelIdleCallback) {
       window.cancelIdleCallback(autosaveIdleRef.current);
@@ -5116,6 +5186,10 @@ export default function ContiProgram() {
     const runAutosave = async () => {
       autosaveIdleRef.current = null;
       if (autosaveLockRef.current) return;
+      if (drawingRef.current || lassoRef.current?.phase !== 'idle' || eraserRef.current?.active) {
+        requestAutosaveRef.current?.();
+        return;
+      }
       setSaveStatus('saving');
       try {
         const data = serializeProject();
@@ -5436,7 +5510,7 @@ export default function ContiProgram() {
 
   // ---------- derived ----------
   const previewSize = Math.max(2, Math.min(34, penSize));
-  const selectedTotalHeight = selectedFrame?.blocks.reduce((s,b) => s+b.height, 0) ?? 0;
+  const selectedTotalHeight = selectedFrame ? getFrameTotalHeight(selectedFrame.blocks) : 0;
   const selectedCutCount = selectedFrame?.blocks.filter(b => b.type === 'cut').length ?? 0;
 
   const selectedBlockLayout = useMemo(() => {
@@ -5645,10 +5719,10 @@ export default function ContiProgram() {
           )}
 
           <div className="conti-section">
-            <h3>cut <span className="count mono">+ height</span></h3>
+            <h3>cut <span className="count mono">{selectedFrame ? `${selectedTotalHeight}/${MAX_FRAME_HEIGHT}px` : '+ height'}</span></h3>
             <div className="conti-preset-grid">
               {DEFAULT_VERTICAL_SIZES.map(h => (
-                <button key={h} className="conti-preset" onClick={() => addCut(h)} disabled={!selectedFrame}>
+                <button key={h} className="conti-preset" onClick={() => addCut(h)} disabled={!selectedFrame || selectedTotalHeight >= MAX_FRAME_HEIGHT}>
                   <span className="conti-preset-num">{h}</span>
                   <span className="conti-preset-sub">+ cut</span>
                 </button>
@@ -5660,7 +5734,7 @@ export default function ContiProgram() {
             <h3>gap <span className="count mono">200 × n</span></h3>
             <div className="conti-preset-grid">
               {DEFAULT_GAP_SIZES.map(h => (
-                <button key={h} className="conti-preset" onClick={() => addGap(h)} disabled={!selectedFrame}>
+                <button key={h} className="conti-preset" onClick={() => addGap(h)} disabled={!selectedFrame || selectedTotalHeight >= MAX_FRAME_HEIGHT}>
                   <span className="conti-preset-num">{h}</span>
                   <span className="conti-preset-sub">+ gap</span>
                 </button>
