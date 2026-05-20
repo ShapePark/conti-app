@@ -2519,7 +2519,42 @@ const GradientColorHandle = ({ x, y, stopValue, which, frameWidth, frameHeight, 
 };
 
 // ---------- FrameView ----------
-const FrameView = forwardRef(function FrameView({
+const areFrameViewPropsEqual = (prev, next) => {
+  // 선택 상태가 바뀌는 frame은 반드시 다시 렌더한다.
+  if (prev.isSelected !== next.isSelected) return false;
+  if (prev.showDimensions !== next.showDimensions) return false;
+  if (prev.activeTool !== next.activeTool) return false;
+  if (prev.selectionPhase !== next.selectionPhase) return false;
+  if (prev.activeLayerType !== next.activeLayerType) return false;
+  if (prev.eraserSize !== next.eraserSize) return false;
+  if (prev.editingGradientBlockId !== next.editingGradientBlockId) return false;
+  if (prev.eraserCursor !== next.eraserCursor) return false;
+  if (prev.selectedBubble !== next.selectedBubble) return false;
+  if (prev.bubblesByLayer !== next.bubblesByLayer) return false;
+  if (prev.typoPresets !== next.typoPresets) return false;
+
+  // frame 객체가 같으면 blocks/layers/canvasWidth도 동일한 것으로 본다.
+  // setFrames에서 변경된 frame만 새 객체로 만들어지므로, 선택되지 않은 다른 frame은 리렌더하지 않는다.
+  if (prev.frame !== next.frame) return false;
+
+  // stable callback으로 고정되어야 하는 props. 바뀌면 안전하게 다시 렌더한다.
+  if (prev.getLayerBitmap !== next.getLayerBitmap) return false;
+  if (prev.onSelect !== next.onSelect) return false;
+  if (prev.onPointerDown !== next.onPointerDown) return false;
+  if (prev.onPointerMove !== next.onPointerMove) return false;
+  if (prev.onPointerUp !== next.onPointerUp) return false;
+  if (prev.onBubbleOverlayPointerDown !== next.onBubbleOverlayPointerDown) return false;
+  if (prev.onBubbleOverlayPointerMove !== next.onBubbleOverlayPointerMove) return false;
+  if (prev.onBubbleOverlayPointerUp !== next.onBubbleOverlayPointerUp) return false;
+  if (prev.onGradientHandlePointerDown !== next.onGradientHandlePointerDown) return false;
+  if (prev.onGradientHandlePointerMove !== next.onGradientHandlePointerMove) return false;
+  if (prev.onGradientHandlePointerUp !== next.onGradientHandlePointerUp) return false;
+  if (prev.onGradientStopColorChange !== next.onGradientStopColorChange) return false;
+
+  return true;
+};
+
+const FrameView = React.memo(forwardRef(function FrameView({
   frame, isSelected, showDimensions, activeTool, selectionPhase,
   getLayerBitmap, bubblesByLayer, selectedBubble, activeLayerType,
   typoPresets, eraserSize, eraserCursor,
@@ -2558,7 +2593,7 @@ const FrameView = forwardRef(function FrameView({
       ctx.globalAlpha = layer.opacity / 100;
       let y = 0;
       for (const b of frame.blocks) {
-        const entry = getLayerBitmap(layer.id, b.id);
+        const entry = getLayerBitmap(frame.id, layer.id, b.id);
         if (entry) ctx.drawImage(entry.canvas, 0, 0, entry.canvas.width, entry.canvas.height,
           0, y - BITMAP_Y_PADDING, entry.logicalWidth, entry.logicalHeight);
         y += b.height;
@@ -2587,7 +2622,8 @@ const FrameView = forwardRef(function FrameView({
       oc.style.width = `${frame.canvasWidth}px`;
       oc.style.height = `${totalHeight}px`;
     }
-    redraw();
+    const rafId = window.requestAnimationFrame(() => redraw());
+    return () => window.cancelAnimationFrame(rafId);
   }, [frame.canvasWidth, totalHeight, redraw]);
 
   // ===================================================================
@@ -2853,7 +2889,7 @@ const FrameView = forwardRef(function FrameView({
       </div>
     </div>
   );
-});
+}), areFrameViewPropsEqual);
 
 // ===================================================================
 //  MAIN COMPONENT
@@ -2875,7 +2911,16 @@ export default function ContiProgram() {
     return strokesByFrameRef.current[frameId][layerId];
   }, []);
 
-  for (const f of frames) for (const l of f.layers) ensureLayerStore(f.id, l.id);
+  useEffect(() => {
+    for (const f of frames) {
+      for (const l of f.layers) ensureLayerStore(f.id, l.id);
+    }
+  }, [frames, ensureLayerStore]);
+
+  const getLayerBitmapResolver = useCallback((frameId, layerId, blockId) => {
+    const fStore = strokesByFrameRef.current[frameId];
+    return fStore?.[layerId]?.bitmaps?.[blockId] || null;
+  }, []);
 
   const getActiveRasterLayerId = useCallback(frame => {
     const l = frame.layers.find(x => x.id === frame.activeLayerId);
@@ -2917,9 +2962,11 @@ export default function ContiProgram() {
   const [storageBackend, setStorageBackend] = useState(null); // 'idb' | 'localStorage' | null
   // bumpRef를 늘리면 useEffect에서 (load 후) 모든 bitmap을 다시 그린다
   const [loadGen, setLoadGen] = useState(0);
+  const [strokeAutosaveTick, setStrokeAutosaveTick] = useState(0);
   // 마운트 시 자동저장 복원을 한 번만 시도
   const autosaveCheckedRef = useRef(false);
   const autosaveTimerRef = useRef(null);
+  const autosaveIdleRef = useRef(null);
   // 저장된 상태 표시 표지를 일정 시간 후 'idle' 로 되돌리기 위한 타이머
   const savedFlashTimerRef = useRef(null);
   // load 직후 자동저장이 다시 트리거되지 않도록 잠시 잠금
@@ -3068,17 +3115,6 @@ export default function ContiProgram() {
     frameRefs.current[selectedFrameId]?.redraw();
     requestAutosaveRef.current?.();
   }, [selectedFrame, selectedFrameId, getActiveRasterLayerId, ensureLayerStore, rebuildBlockBitmap]);
-
-  const getLayerBitmapRef = useRef({});
-  for (const f of frames) {
-    if (!getLayerBitmapRef.current[f.id]) {
-      const fid = f.id;
-      getLayerBitmapRef.current[fid] = (layerId, blockId) => {
-        const fStore = strokesByFrameRef.current[fid];
-        return fStore?.[layerId]?.bitmaps[blockId] || null;
-      };
-    }
-  }
 
   // ---------- block-row drag ----------
   const [dragId, setDragId] = useState(null);
@@ -4187,7 +4223,7 @@ export default function ContiProgram() {
     renderStrokeToCtx(entry.ctx, stored, BITMAP_Y_PADDING);
     fref?.redraw();
     fref?.clearOverlay();
-    requestAutosaveRef.current?.();
+    setStrokeAutosaveTick(t => t + 1);
     return true;
   };
 
@@ -4262,7 +4298,6 @@ export default function ContiProgram() {
     if (!window.confirm(sc > 0 ? `"${target?.name}" 삭제 시 ${sc}개 stroke도 함께 사라집니다. 계속하시겠습니까?` : `"${target?.name}" 을(를) 삭제합니다. 계속하시겠습니까?`)) return;
     delete strokesByFrameRef.current[id];
     delete frameRefs.current[id];
-    delete getLayerBitmapRef.current[id];
     setFrames(arr => {
       const next = arr.filter(f => f.id !== id);
       if (id === selectedFrameId) {
@@ -5027,17 +5062,7 @@ export default function ContiProgram() {
     setSelectionPhase('idle');
     setSelectedBubble(null);
 
-    // 5) 새 frame 의 getLayerBitmap 클로저를 미리 등록
-    getLayerBitmapRef.current = {};
-    for (const f of (data.frames || [])) {
-      const fid = f.id;
-      getLayerBitmapRef.current[fid] = (layerId, blockId) => {
-        const fStore = strokesByFrameRef.current[fid];
-        return fStore?.[layerId]?.bitmaps[blockId] || null;
-      };
-    }
-
-    // 6) state 갈아끼우기
+    // 5) state 갈아끼우기
     const newFrames = data.frames.map(f => ({
       ...f,
       blocks: (f.blocks || []).map(b => ({ ...b })),
@@ -5083,7 +5108,13 @@ export default function ContiProgram() {
     if (autosaveLockRef.current) return;
     setSaveStatus('dirty');
     if (autosaveTimerRef.current) clearTimeout(autosaveTimerRef.current);
-    autosaveTimerRef.current = setTimeout(async () => {
+    if (autosaveIdleRef.current != null && window.cancelIdleCallback) {
+      window.cancelIdleCallback(autosaveIdleRef.current);
+      autosaveIdleRef.current = null;
+    }
+
+    const runAutosave = async () => {
+      autosaveIdleRef.current = null;
       if (autosaveLockRef.current) return;
       setSaveStatus('saving');
       try {
@@ -5109,7 +5140,16 @@ export default function ContiProgram() {
           setSaveStatus('error');
         }
       } catch (_) { setSaveStatus('error'); }
-    }, 1500);
+    };
+
+    autosaveTimerRef.current = setTimeout(() => {
+      autosaveTimerRef.current = null;
+      if ('requestIdleCallback' in window) {
+        autosaveIdleRef.current = window.requestIdleCallback(runAutosave, { timeout: 2000 });
+      } else {
+        runAutosave();
+      }
+    }, 3000);
   }, [serializeProject, computeProjectMeta, currentProjectName, currentProjectId]);
 
   // useCallback hooks 등에서 stale closure 없이 호출할 수 있게 ref 동기화
@@ -5119,7 +5159,7 @@ export default function ContiProgram() {
   useEffect(() => {
     if (autosaveLockRef.current) return;
     requestAutosave();
-  }, [frames, bubblesByLayer, typoPresets, requestAutosave]);
+  }, [frames, bubblesByLayer, typoPresets, strokeAutosaveTick, requestAutosave]);
 
   // 마운트 시 자동 저장본을 1회 검사해서 복원 여부를 묻는다
   useEffect(() => {
@@ -5266,7 +5306,6 @@ export default function ContiProgram() {
     autosaveLockRef.current = true;
     // strokes, lasso, drawing 정리
     strokesByFrameRef.current = {};
-    getLayerBitmapRef.current = {};
     lassoRef.current = {
       phase: 'idle', frameId: null, layerId: null,
       lassoPoints: [], selectedItems: [], bbox: null,
@@ -5725,7 +5764,7 @@ export default function ContiProgram() {
                 showDimensions={f.id === selectedFrameId}
                 activeTool={activeTool}
                 selectionPhase={selectionPhase}
-                getLayerBitmap={getLayerBitmapRef.current[f.id] || (() => null)}
+                getLayerBitmap={getLayerBitmapResolver}
                 bubblesByLayer={bubblesByLayer}
                 selectedBubble={selectedBubble}
                 activeLayerType={f.id === selectedFrameId ? activeLayerType : 'raster'}
