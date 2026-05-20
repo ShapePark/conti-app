@@ -1,5 +1,5 @@
 import React, {
-  useState, useRef, useLayoutEffect, useMemo, useCallback,
+  useState, useRef, useMemo, useCallback,
   useEffect, forwardRef, useImperativeHandle,
 } from 'react';
 
@@ -14,6 +14,7 @@ const PEN_MIN = 0.1;
 const PEN_MAX = 1000;
 const sliderToSize = (s) => PEN_MIN * Math.pow(PEN_MAX / PEN_MIN, s / 100);
 const sizeToSlider = (sz) => 100 * Math.log(sz / PEN_MIN) / Math.log(PEN_MAX / PEN_MIN);
+const clampPenSize = (value) => Math.max(PEN_MIN, Math.min(PEN_MAX, Math.round((Number(value) || 0) * 10) / 10));
 
 // ---------- system constants ----------
 const DEFAULT_VERTICAL_SIZES = [200, 300, 400, 600, 800, 1000, 1200];
@@ -341,7 +342,7 @@ const paintGradientToCtx = (ctx, g, x, y, width, height) => {
 };
 
 const SCHEMA_VERSION = 1;
-const APP_VERSION = 'conti.v29';
+const APP_VERSION = 'conti.v33.1-block-add-optimized';
 const DB_NAME = 'conti_program_db';
 const DB_STORE = 'projects';
 const AUTOSAVE_ID = '__autosave__';
@@ -1694,6 +1695,17 @@ const STYLES = `
 }
 .conti-num:focus { outline: none; border-color: var(--ink); }
 .conti-tool-unit { font-family: 'JetBrains Mono', monospace; font-size: 11px; color: var(--muted); margin-left: -4px; }
+.conti-tool-stepper {
+  display: inline-flex; align-items: center; gap: 4px; flex-shrink: 0;
+}
+.conti-tool-step-btn {
+  width: 22px; height: 22px; display: inline-flex; align-items: center; justify-content: center;
+  background: var(--paper); border: 1px solid var(--line); border-radius: 4px;
+  font-family: 'JetBrains Mono', monospace; font-size: 13px; line-height: 1; color: var(--ink);
+  transition: all 0.12s ease;
+}
+.conti-tool-step-btn:hover { border-color: var(--ink-2); background: var(--bg-panel); }
+.conti-tool-step-btn:active { background: var(--line); }
 .conti-pen-preview {
   width: 38px; height: 38px; display: flex; align-items: center; justify-content: center;
   background: var(--paper); border: 1px solid var(--line); border-radius: 50%; flex-shrink: 0;
@@ -2059,9 +2071,26 @@ const STYLES = `
 .conti-block-row {
   position: relative; display: flex; align-items: center; gap: 6px; padding: 6px 8px;
   background: var(--paper); border: 1px solid var(--line); border-radius: 5px; margin-bottom: 4px;
-  transition: border-color 0.12s ease, opacity 0.15s ease;
+  transition: border-color 0.12s ease, opacity 0.15s ease, background 0.12s ease, box-shadow 0.12s ease;
 }
 .conti-block-row:hover { border-color: var(--ink-2); }
+.conti-block-row.type-cut {
+  background: linear-gradient(90deg, rgba(15,15,15,0.06) 0 18px, var(--paper) 18px 100%);
+  border-color: rgba(15,15,15,0.16);
+}
+.conti-block-row.type-cut:hover {
+  border-color: var(--ink);
+  background: linear-gradient(90deg, rgba(15,15,15,0.09) 0 18px, color-mix(in srgb, var(--paper) 82%, var(--bg-panel)) 18px 100%);
+}
+.conti-block-row.type-gap {
+  background: linear-gradient(90deg, rgba(196,58,44,0.16) 0 18px, rgba(196,58,44,0.06) 18px 100%);
+  border-color: rgba(196,58,44,0.42);
+  box-shadow: inset 0 0 0 1px rgba(196,58,44,0.08);
+}
+.conti-block-row.type-gap:hover {
+  border-color: var(--accent);
+  background: linear-gradient(90deg, rgba(196,58,44,0.22) 0 18px, rgba(196,58,44,0.09) 18px 100%);
+}
 .conti-block-row.dragging { opacity: 0.35; border-color: var(--accent); border-style: dashed; }
 .conti-drag-handle {
   width: 14px; height: 22px; display: flex; align-items: center; justify-content: center;
@@ -2074,7 +2103,13 @@ const STYLES = `
   text-transform: uppercase; padding: 2px 5px; border-radius: 3px; flex-shrink: 0;
 }
 .conti-block-tag.cut { background: var(--ink); color: var(--paper); }
-.conti-block-tag.gap { background: var(--accent-soft); color: var(--accent); }
+.conti-block-tag.gap { background: var(--accent); color: var(--paper); }
+.conti-block-kind {
+  font-family: 'JetBrains Mono', monospace; font-size: 9px; letter-spacing: 0.08em;
+  text-transform: uppercase; padding: 2px 4px; border-radius: 3px; flex-shrink: 0;
+}
+.conti-block-kind.type-cut { background: rgba(15,15,15,0.08); color: var(--ink); }
+.conti-block-kind.type-gap { background: rgba(196,58,44,0.12); color: var(--accent); }
 .conti-block-row input {
   width: 100%; min-width: 0; flex: 1; padding: 2px 4px; font-family: 'JetBrains Mono', monospace; font-size: 11px;
   background: transparent; border: 1px solid transparent; border-radius: 3px; text-align: right; color: var(--ink);
@@ -2107,6 +2142,11 @@ const STYLES = `
   display: flex; align-items: center; gap: 4px; padding: 4px 8px 6px 8px;
   margin-top: -6px; margin-bottom: 4px; background: var(--bg-panel);
   border: 1px solid var(--line); border-top: none; border-radius: 0 0 5px 5px;
+  transition: border-color 0.12s ease, background 0.12s ease, box-shadow 0.12s ease;
+}
+.conti-block-margin-row.type-cut {
+  background: linear-gradient(90deg, rgba(15,15,15,0.06) 0 18px, var(--bg-panel) 18px 100%);
+  border-color: rgba(15,15,15,0.16);
 }
 .conti-margin-label {
   font-family: 'JetBrains Mono', monospace; font-size: 9px; letter-spacing: 0.06em;
@@ -2270,7 +2310,10 @@ const STYLES = `
 
 /* viewport-active */
 .conti-block-row.viewport-active {
-  border-color: var(--accent); background: var(--accent-soft); box-shadow: inset 3px 0 0 var(--accent);
+  border-color: var(--accent); background: var(--accent-soft); box-shadow: inset 4px 0 0 var(--accent), 0 0 0 1px rgba(196,58,44,0.06);
+}
+.conti-block-row.type-gap.viewport-active {
+  background: color-mix(in srgb, var(--accent-soft) 78%, rgba(196,58,44,0.12));
 }
 .conti-block-row.viewport-active .conti-block-tag.cut { background: var(--accent); }
 .conti-block-row.viewport-active .conti-block-tag.gap { background: var(--accent); color: var(--paper); }
@@ -2597,6 +2640,9 @@ const FrameView = React.memo(forwardRef(function FrameView({
   const canvasRef = useRef(null);
   const overlayRef = useRef(null);
   const dprRef = useRef(1);
+  const canvasLayoutRef = useRef({
+    width: 0, height: 0, dpr: 1, blocks: [],
+  });
 
   const totalHeight = useMemo(() => getFrameTotalHeight(frame.blocks), [frame.blocks]);
 
@@ -2661,29 +2707,81 @@ const FrameView = React.memo(forwardRef(function FrameView({
 
   const redraw = useCallback(() => redrawRegion(null), [redrawRegion]);
 
-  useLayoutEffect(() => {
-    const dpr = getSafeCanvasDpr(frame.canvasWidth, totalHeight, Math.min(window.devicePixelRatio || 1, DPR_CAP));
-    dprRef.current = dpr;
-    const c = canvasRef.current;
-    if (c) {
-      c.width = Math.max(1, frame.canvasWidth * dpr);
-      c.height = Math.max(1, totalHeight * dpr);
-      c.style.width = `${frame.canvasWidth}px`;
-      c.style.height = `${totalHeight}px`;
-      const ctx = c.getContext('2d');
-      ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.scale(dpr, dpr);
-      ctx.lineCap = 'round'; ctx.lineJoin = 'round';
-    }
-    const oc = overlayRef.current;
-    if (oc) {
-      oc.width = Math.max(1, frame.canvasWidth * dpr);
-      oc.height = Math.max(1, totalHeight * dpr);
-      oc.style.width = `${frame.canvasWidth}px`;
-      oc.style.height = `${totalHeight}px`;
-    }
-    const rafId = window.requestAnimationFrame(() => redraw());
+  useEffect(() => {
+    const rafId = window.requestAnimationFrame(() => {
+      const dpr = getSafeCanvasDpr(frame.canvasWidth, totalHeight, Math.min(window.devicePixelRatio || 1, DPR_CAP));
+      dprRef.current = dpr;
+
+      const prev = canvasLayoutRef.current || { width: 0, height: 0, dpr: 1, blocks: [] };
+      const prevBlocks = prev.blocks || [];
+      const nextBlocks = frame.blocks || [];
+      const isTailAppendOnly =
+        prevBlocks.length > 0 &&
+        nextBlocks.length === prevBlocks.length + 1 &&
+        prevBlocks.every((b, i) => {
+          const n = nextBlocks[i];
+          return n && n.id === b.id && n.type === b.type && n.height === b.height;
+        });
+
+      const c = canvasRef.current;
+      let canReuseMainPixels = false;
+      let oldMainCanvas = null;
+      if (c) {
+        const nextPixelW = Math.max(1, Math.round(frame.canvasWidth * dpr));
+        const nextPixelH = Math.max(1, Math.round(totalHeight * dpr));
+        const sameWidth = prev.width === frame.canvasWidth;
+        canReuseMainPixels = sameWidth && isTailAppendOnly && c.width > 0 && c.height > 0;
+
+        if (canReuseMainPixels && (c.width !== nextPixelW || c.height !== nextPixelH)) {
+          oldMainCanvas = document.createElement('canvas');
+          oldMainCanvas.width = c.width;
+          oldMainCanvas.height = c.height;
+          oldMainCanvas.getContext('2d').drawImage(c, 0, 0);
+        }
+
+        if (c.width !== nextPixelW) c.width = nextPixelW;
+        if (c.height !== nextPixelH) c.height = nextPixelH;
+        c.style.width = `${frame.canvasWidth}px`;
+        c.style.height = `${totalHeight}px`;
+
+        const ctx = c.getContext('2d');
+        ctx.setTransform(1, 0, 0, 1, 0, 0);
+        if (oldMainCanvas) {
+          const preservedLogicalH = Math.max(1, prev.height || 1);
+          ctx.drawImage(
+            oldMainCanvas,
+            0, 0, oldMainCanvas.width, oldMainCanvas.height,
+            0, 0, Math.max(1, Math.round(frame.canvasWidth * dpr)), Math.max(1, Math.round(preservedLogicalH * dpr)),
+          );
+        }
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        ctx.lineCap = 'round';
+        ctx.lineJoin = 'round';
+      }
+
+      const oc = overlayRef.current;
+      if (oc) {
+        const nextPixelW = Math.max(1, Math.round(frame.canvasWidth * dpr));
+        const nextPixelH = Math.max(1, Math.round(totalHeight * dpr));
+        if (oc.width !== nextPixelW) oc.width = nextPixelW;
+        if (oc.height !== nextPixelH) oc.height = nextPixelH;
+        oc.style.width = `${frame.canvasWidth}px`;
+        oc.style.height = `${totalHeight}px`;
+      }
+
+      canvasLayoutRef.current = {
+        width: frame.canvasWidth,
+        height: totalHeight,
+        dpr,
+        blocks: nextBlocks.map(b => ({ id: b.id, type: b.type, height: b.height })),
+      };
+
+      // cut/gap을 맨 아래에 추가한 경우 기존 canvas 픽셀을 보존했으므로 전체 redraw를 생략한다.
+      // 그 외의 레이아웃 변경(삭제, 순서 변경, 높이 변경, DPR 변경)은 block top이 바뀌므로 전체 redraw가 필요하다.
+      if (!canReuseMainPixels) redraw();
+    });
     return () => window.cancelAnimationFrame(rafId);
-  }, [frame.canvasWidth, totalHeight, redraw]);
+  }, [frame.canvasWidth, totalHeight, frame.blocks, redraw]);
 
   // ===================================================================
   // iPad / Apple Pencil 안정화:
@@ -3072,6 +3170,38 @@ export default function ContiProgram() {
     const elRect = el.getBoundingClientRect();
     area.scrollTo({ left: area.scrollLeft + elRect.left - areaRect.left - 80, top: 0, behavior: 'smooth' });
   }, []);
+
+  const adjustPenSize = useCallback(delta => {
+    setPenSize(curr => clampPenSize(curr + delta));
+  }, []);
+
+  const selectAndScrollToBlock = useCallback(blockId => {
+    if (!selectedFrame) return;
+    const block = selectedFrame.blocks.find(b => b.id === blockId);
+    if (!block) return;
+    setActiveBlockId(blockId);
+    const area = canvasAreaRef.current;
+    if (!area) return;
+    const frameEl = area.querySelector(`[data-frame-id="${selectedFrameId}"]`);
+    if (!frameEl) return;
+    const stageEl = frameEl.querySelector('.conti-frame-stage');
+    if (!stageEl) return;
+    const areaRect = area.getBoundingClientRect();
+    const frameRect = frameEl.getBoundingClientRect();
+    const stageRect = stageEl.getBoundingClientRect();
+    const tops = computeBlockTops(selectedFrame.blocks);
+    const blockTop = tops[blockId] || 0;
+    const blockCenterY = blockTop + block.height / 2;
+    const nextTop = Math.max(0, area.scrollTop + (stageRect.top - areaRect.top) + blockCenterY - area.clientHeight / 2);
+    const nextLeft = Math.max(0, area.scrollLeft + frameRect.left - areaRect.left - 80);
+    area.scrollTo({ left: nextLeft, top: nextTop, behavior: 'smooth' });
+  }, [selectedFrame, selectedFrameId]);
+
+  const handleBlockRowJump = useCallback((e, blockId) => {
+    const target = e?.target;
+    if (target && typeof target.closest === 'function' && target.closest('button, input, textarea, select, option, label')) return;
+    selectAndScrollToBlock(blockId);
+  }, [selectAndScrollToBlock]);
 
   // ---------- bitmap management ----------
   const getBitmapDpr = useCallback((logicalWidth, logicalHeight) => getSafeCanvasDpr(logicalWidth, logicalHeight, Math.min(window.devicePixelRatio || 1, DPR_CAP)), []);
@@ -4523,7 +4653,6 @@ export default function ContiProgram() {
     setFrames(arr => arr.map(f => f.id === selectedFrameId
       ? { ...f, blocks: [...f.blocks, { id: newId(), type: 'cut', height: nextHeight, marginLeft: sm, marginRight: sm }] }
       : f));
-    redrawSelectedFrameSoon();
     requestAutosaveRef.current?.();
   };
 
@@ -4535,7 +4664,6 @@ export default function ContiProgram() {
     setFrames(arr => arr.map(f => f.id === selectedFrameId
       ? { ...f, blocks: [...f.blocks, { id: newId(), type: 'gap', height: nextHeight }] }
       : f));
-    redrawSelectedFrameSoon();
     requestAutosaveRef.current?.();
   };
 
@@ -5595,9 +5723,13 @@ export default function ContiProgram() {
             <div className="conti-tool">
               <span className="conti-tool-label">size</span>
               <input type="range" min="0" max="100" step="0.5" value={sizeToSlider(penSize)}
-                onChange={e => setPenSize(Math.round(sliderToSize(parseFloat(e.target.value)) * 10) / 10)} />
+                onChange={e => setPenSize(clampPenSize(sliderToSize(parseFloat(e.target.value))))} />
+              <div className="conti-tool-stepper">
+                <button className="conti-tool-step-btn" title="-0.5px" onClick={() => adjustPenSize(-0.5)}>−</button>
+                <button className="conti-tool-step-btn" title="+0.5px" onClick={() => adjustPenSize(0.5)}>+</button>
+              </div>
               <input className="conti-num" type="number" min={PEN_MIN} max={PEN_MAX} step="0.1" value={penSize}
-                onChange={e => { const v = parseFloat(e.target.value); if (Number.isFinite(v)) setPenSize(Math.max(PEN_MIN, Math.min(PEN_MAX, v))); }} />
+                onChange={e => { const v = parseFloat(e.target.value); if (Number.isFinite(v)) setPenSize(clampPenSize(v)); }} />
               <span className="conti-tool-unit">px</span>
             </div>
             <div className="conti-tool">
@@ -5944,7 +6076,14 @@ export default function ContiProgram() {
                   return (
                     <div key={b.id} data-block-id={b.id}>
                       {showAbove && <div style={{ position:'relative',height:3,background:'var(--accent)',borderRadius:2,margin:'0 0 2px 0' }} />}
-                      <div className={`conti-block-row${mainAttachBottom ? ' has-margin' : ''} ${dragId === b.id ? 'dragging' : ''} ${b.id === activeBlockId ? 'viewport-active' : ''}`}>
+                      <div
+                        className={`conti-block-row type-${b.type}${mainAttachBottom ? ' has-margin' : ''} ${dragId === b.id ? 'dragging' : ''} ${b.id === activeBlockId ? 'viewport-active' : ''}`}
+                        onClick={e => handleBlockRowJump(e, b.id)}
+                        onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); selectAndScrollToBlock(b.id); } }}
+                        role="button"
+                        tabIndex={0}
+                        title="클릭하면 캔버스의 해당 block 위치로 이동"
+                      >
                         <button className="conti-drag-handle"
                           onPointerDown={e => handleHandlePointerDown(e, b.id)}
                           onPointerMove={handleHandlePointerMove}
@@ -5958,6 +6097,9 @@ export default function ContiProgram() {
                         </button>
                         <span className={`conti-block-tag ${b.type}`}>
                           {b.type === 'cut' ? `c${String(b.num).padStart(2,'0')}` : 'gap'}
+                        </span>
+                        <span className={`conti-block-kind type-${b.type}`}>
+                          {isCut ? 'CUT' : 'GAP'}
                         </span>
                         <NumberInputWithDraft
                           min={50} max={5000} step={50}
@@ -5991,7 +6133,11 @@ export default function ContiProgram() {
                         <button className="del" onClick={() => removeBlock(b.id)} title="삭제">×</button>
                       </div>
                       {isCut && (
-                        <div className={`conti-block-margin-row${marginAttachBottom ? ' attach-bottom' : ''}${b.id === activeBlockId ? ' viewport-active' : ''}`}>
+                        <div
+                          className={`conti-block-margin-row type-cut${marginAttachBottom ? ' attach-bottom' : ''}${b.id === activeBlockId ? ' viewport-active' : ''}`}
+                          onClick={e => handleBlockRowJump(e, b.id)}
+                          title="클릭하면 캔버스의 해당 block 위치로 이동"
+                        >
                           <span className="conti-margin-label">L</span>
                           <input type="number" min="0" max="500" step="2"
                             value={b.marginLeft ?? selectedFrame.sideMargin}
@@ -6004,7 +6150,11 @@ export default function ContiProgram() {
                         </div>
                       )}
                       {isEditingFlat && (
-                        <div className={`conti-block-flat-row${b.id === activeBlockId ? ' viewport-active' : ''}`}>
+                        <div
+                          className={`conti-block-flat-row${b.id === activeBlockId ? ' viewport-active' : ''}`}
+                          onClick={e => handleBlockRowJump(e, b.id)}
+                          title="클릭하면 캔버스의 해당 block 위치로 이동"
+                        >
                           <span className="flat-color-label">COLOR</span>
                           {FLAT_COLOR_STEPS.map(step => (
                             <div
@@ -6025,7 +6175,11 @@ export default function ContiProgram() {
                         </div>
                       )}
                       {isEditingGrad && b.gradient && (
-                        <div className={`conti-block-gradient-row${b.id === activeBlockId ? ' viewport-active' : ''}`}>
+                        <div
+                          className={`conti-block-gradient-row${b.id === activeBlockId ? ' viewport-active' : ''}`}
+                          onClick={e => handleBlockRowJump(e, b.id)}
+                          title="클릭하면 캔버스의 해당 block 위치로 이동"
+                        >
                           <div className="grad-header">
                             <span className="grad-label">GRADIENT</span>
                             <div className="grad-bar"
