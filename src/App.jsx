@@ -622,6 +622,73 @@ const renderLiveStrokeToOverlay = (oc, dpr, stroke) => {
   renderStrokeToCtx(ctx, stroke, 0);
 };
 
+
+
+// 진행 중인 stroke 를 overlay 에 incremental + rAF 방식으로 표시한다.
+// 기존 방식처럼 매 pointermove 마다 overlay 전체를 clear 하고 stroke 전체 path 를
+// 다시 그리면, stroke 길이가 길어질수록 O(n^2) 로 느려진다. iPad/Apple Pencil 에서는
+// coalesced point 가 한 번에 많이 들어오기 때문에 더 쉽게 멈춘 것처럼 보인다.
+const clearLiveStrokeOverlay = (oc) => {
+  if (!oc) return;
+  const ctx = oc.getContext('2d');
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.clearRect(0, 0, oc.width, oc.height);
+};
+
+const beginLiveStrokeOverlay = (oc, dpr, stroke) => {
+  clearLiveStrokeOverlay(oc);
+  if (!oc || !stroke?.points?.length) return null;
+  const ctx = oc.getContext('2d');
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.lineCap = 'round';
+  ctx.lineJoin = 'round';
+  const colorHex = stroke.color || '#0F0F0F';
+  ctx.fillStyle = hexToRgba(colorHex, stroke.opacity);
+  const p0 = stroke.points[0];
+  ctx.beginPath();
+  ctx.arc(p0.x, p0.y, stroke.size / 2, 0, Math.PI * 2);
+  ctx.fill();
+  return p0;
+};
+
+const appendLiveStrokeOverlay = (oc, dpr, stroke, fromPoint, newPoints) => {
+  if (!oc || !stroke || !fromPoint || !newPoints || newPoints.length === 0) return fromPoint;
+  const ctx = oc.getContext('2d');
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.lineCap = 'round';
+  ctx.lineJoin = 'round';
+  const colorHex = stroke.color || '#0F0F0F';
+  ctx.strokeStyle = hexToRgba(colorHex, stroke.opacity);
+  ctx.lineWidth = stroke.size;
+  ctx.beginPath();
+  ctx.moveTo(fromPoint.x, fromPoint.y);
+  for (const p of newPoints) ctx.lineTo(p.x, p.y);
+  ctx.stroke();
+  return newPoints[newPoints.length - 1];
+};
+
+const flushLiveStrokeOverlay = (drawState) => {
+  if (!drawState) return;
+  drawState.liveRafId = null;
+  const pending = drawState.pendingLivePoints;
+  if (!pending || pending.length === 0) return;
+  drawState.pendingLivePoints = [];
+  drawState.liveLastPoint = appendLiveStrokeOverlay(
+    drawState.overlayEl,
+    drawState.dpr,
+    drawState.strokeRef?.current,
+    drawState.liveLastPoint,
+    pending
+  );
+};
+
+const queueLiveStrokeOverlay = (drawState, points) => {
+  if (!drawState || !points || points.length === 0) return;
+  drawState.pendingLivePoints.push(...points);
+  if (drawState.liveRafId) return;
+  drawState.liveRafId = requestAnimationFrame(() => flushLiveStrokeOverlay(drawState));
+};
+
 const createBlockBitmap = (logicalWidth, logicalHeight, dpr) => {
   const canvas = document.createElement('canvas');
   canvas.width = Math.max(1, Math.ceil(logicalWidth * dpr));
@@ -2575,7 +2642,7 @@ const FrameView = forwardRef(function FrameView({
     clearOverlay: () => {
       const oc = overlayRef.current;
       if (!oc) return;
-      oc.getContext('2d').clearRect(0, 0, oc.width, oc.height);
+      clearLiveStrokeOverlay(oc);
     },
   }), [redraw]);
 
@@ -2668,8 +2735,10 @@ const FrameView = forwardRef(function FrameView({
             else onPointerUp(e, overlayRef.current);
           }}
           onPointerLeave={e => {
-            if (isVectorActive) onBubbleOverlayPointerUp(e, frame.id, overlayRef.current);
-            else onPointerUp(e, overlayRef.current);
+            const oc = overlayRef.current;
+            if (oc?.hasPointerCapture?.(e.pointerId)) return;
+            if (isVectorActive) onBubbleOverlayPointerUp(e, frame.id, oc);
+            else onPointerUp(e, oc);
           }}
         />
 
@@ -3861,6 +3930,13 @@ export default function ContiProgram() {
   // ===================================================================
   const handlePointerDown = (e, frameId, overlayEl) => {
     if (activeTool === 'lasso') { handleLassoPointerDown(e, frameId, overlayEl); return; }
+    // Apple Pencil stroke 중 palm/finger pointerdown 이 들어오면 진행 중인 stroke 를
+    // touch stroke 로 덮어쓰거나 조기 commit 하지 않도록 무시한다.
+    if (drawingRef.current && e.pointerId !== drawingRef.current.pointerId) {
+      if (e.cancelable) e.preventDefault();
+      try { overlayEl?.releasePointerCapture(e.pointerId); } catch(_) {}
+      return;
+    }
     if (activeTool === 'eraser') {
       if (e.pointerType === 'touch') {
         activeTouchPointersRef.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
@@ -3901,16 +3977,20 @@ export default function ContiProgram() {
       const p = getCanvasPoint(e, overlayEl, frame);
       // pointermove 마다 frames.find / blocks.reduce 다시 안 하도록 캐싱
       const fref = frameRefs.current[frameId];
-      drawingRef.current = { frameId, layerId: activeLayerId, frame, dpr: fref?.getDpr() || 1 };
+      drawingRef.current = {
+        frameId, layerId: activeLayerId, frame, dpr: fref?.getDpr() || 1,
+        pointerId: e.pointerId, pointerType: e.pointerType, overlayEl, strokeRef: currentStrokeRef,
+        pendingLivePoints: [], liveRafId: null, liveLastPoint: null,
+      };
       currentStrokeRef.current = { points: [p], size: penSize, opacity: penOpacity / 100, color: penColor };
       // 시작점 dot 을 overlay 에 (main canvas 는 건드리지 않음)
-      renderLiveStrokeToOverlay(overlayEl, drawingRef.current.dpr, currentStrokeRef.current);
+      drawingRef.current.liveLastPoint = beginLiveStrokeOverlay(overlayEl, drawingRef.current.dpr, currentStrokeRef.current);
       return;
     }
     if (e.pointerType === 'touch') {
       activeTouchPointersRef.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
       if (activeTouchPointersRef.current.size >= 2) {
-        if (drawingRef.current) {
+        if (drawingRef.current && drawingRef.current.pointerType !== 'pen') {
           // 그리는 도중 두번째 손가락이 닿으면 pan 모드로 전환된다.
           // 진행 중이던 live stroke 는 버리고, overlay 만 지우면 된다.
           // (main canvas 는 그리는 동안 건드린 적이 없으므로 redraw 불필요)
@@ -3941,9 +4021,13 @@ export default function ContiProgram() {
     try { overlayEl.setPointerCapture(e.pointerId); } catch(_) {}
     const p = getCanvasPoint(e, overlayEl, frame);
     const fref = frameRefs.current[frameId];
-    drawingRef.current = { frameId, layerId: activeLayerId, frame, dpr: fref?.getDpr() || 1 };
+    drawingRef.current = {
+      frameId, layerId: activeLayerId, frame, dpr: fref?.getDpr() || 1,
+      pointerId: e.pointerId, pointerType: e.pointerType, overlayEl, strokeRef: currentStrokeRef,
+      pendingLivePoints: [], liveRafId: null, liveLastPoint: null,
+    };
     currentStrokeRef.current = { points: [p], size: penSize, opacity: penOpacity / 100, color: penColor };
-    renderLiveStrokeToOverlay(overlayEl, drawingRef.current.dpr, currentStrokeRef.current);
+    drawingRef.current.liveLastPoint = beginLiveStrokeOverlay(overlayEl, drawingRef.current.dpr, currentStrokeRef.current);
   };
 
   const handlePointerMove = (e, overlayEl) => {
@@ -3987,6 +4071,7 @@ export default function ContiProgram() {
       eraseAtPoint(eraserRef.current.frameId, frame, eraserRef.current.layerId, p.x, p.y, eraserSize / 2);
       return;
     }
+    if (drawingRef.current && e.pointerId !== drawingRef.current.pointerId) return;
     if (e.pointerType === 'touch') {
       if (activeTouchPointersRef.current.has(e.pointerId))
         activeTouchPointersRef.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
@@ -4032,10 +4117,13 @@ export default function ContiProgram() {
 
     const s = currentStrokeRef.current;
 
-    // 먼저 이번 프레임의 모든 포인트를 수집한다
+    // 먼저 이번 프레임의 모든 포인트를 수집한다. live preview 는 rAF 로 묶어서
+    // 한 프레임당 한 번만 incremental draw 한다.
+    const newPoints = [];
     for (const ev of events) {
       const p = getCanvasPoint(ev, overlayEl, frame);
       s.points.push(p);
+      newPoints.push(p);
     }
 
     // ── 핵심 성능 개선 ─────────────────────────────────────────────
@@ -4050,7 +4138,7 @@ export default function ContiProgram() {
     //
     // overlay 는 매번 clear 후 단일 path 로 stroke 전체를 그리므로 round-cap
     // 겹침에 의한 opacity 누적 문제도 그대로 없다.
-    renderLiveStrokeToOverlay(overlayEl, draw.dpr, s);
+    queueLiveStrokeOverlay(draw, newPoints);
   };
 
   const handlePointerUp = (e, overlayEl) => {
@@ -4091,7 +4179,13 @@ export default function ContiProgram() {
       if (activeTouchPointersRef.current.size === 0) twoFingerTapRef.current = { active: false, startMap: null, moved: false };
       if (activeTouchPointersRef.current.size < 2) panStateRef.current = null;
     }
+    if (drawingRef.current && e.pointerId !== drawingRef.current.pointerId) {
+      if (e.pointerType === 'touch') activeTouchPointersRef.current.delete(e.pointerId);
+      return;
+    }
     const drawState = drawingRef.current, liveStroke = currentStrokeRef.current;
+    if (drawState?.liveRafId) { cancelAnimationFrame(drawState.liveRafId); flushLiveStrokeOverlay(drawState); }
+    else flushLiveStrokeOverlay(drawState);
     drawingRef.current = null; currentStrokeRef.current = null;
     if (!drawState || !liveStroke || liveStroke.points.length === 0) return;
     const frame = frames.find(f => f.id === drawState.frameId);
