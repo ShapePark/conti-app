@@ -342,7 +342,7 @@ const paintGradientToCtx = (ctx, g, x, y, width, height) => {
 };
 
 const SCHEMA_VERSION = 1;
-const APP_VERSION = 'conti.v33.1-block-add-optimized';
+const APP_VERSION = 'conti.v34-preview';
 const DB_NAME = 'conti_program_db';
 const DB_STORE = 'projects';
 const AUTOSAVE_ID = '__autosave__';
@@ -921,16 +921,64 @@ const composeRasterLayerCanvas = (frame, layerStore, canvasW, canvasH) => {
 // 한 벡터(말풍선) 레이어를 SVG 로 직렬화한 뒤 캔버스로 래스터화한다.
 // BubbleSVG 와 동일한 path 헬퍼(getRoundedRectPath / getThoughtBubblePath /
 // getShoutBubblePath / getBubbleEdgePoint) 를 그대로 사용한다.
+const drawCanvasRoundedRectPath = (ctx, x, y, w, h, r = 108) => {
+  const R = Math.min(r, w / 2, h / 2);
+  ctx.beginPath();
+  ctx.moveTo(x + R, y);
+  ctx.lineTo(x + w - R, y);
+  ctx.quadraticCurveTo(x + w, y, x + w, y + R);
+  ctx.lineTo(x + w, y + h - R);
+  ctx.quadraticCurveTo(x + w, y + h, x + w - R, y + h);
+  ctx.lineTo(x + R, y + h);
+  ctx.quadraticCurveTo(x, y + h, x, y + h - R);
+  ctx.lineTo(x, y + R);
+  ctx.quadraticCurveTo(x, y, x + R, y);
+  ctx.closePath();
+};
+
+const drawCanvasSpikyEllipsePath = (ctx, cx, cy, rx, ry, pointCount, innerScale) => {
+  ctx.beginPath();
+  for (let i = 0; i < pointCount; i++) {
+    const angle = (i / pointCount) * Math.PI * 2 - Math.PI / 2;
+    const sc = i % 2 === 0 ? 1.0 : innerScale;
+    const px = cx + rx * sc * Math.cos(angle);
+    const py = cy + ry * sc * Math.sin(angle);
+    if (i === 0) ctx.moveTo(px, py);
+    else ctx.lineTo(px, py);
+  }
+  ctx.closePath();
+};
+
+const wrapCanvasTextLines = (ctx, text, maxWidth) => {
+  const paragraphs = String(text || '').split('\n');
+  const lines = [];
+  for (const paragraph of paragraphs) {
+    if (!paragraph) { lines.push(''); continue; }
+    let line = '';
+    for (const ch of Array.from(paragraph)) {
+      const next = line + ch;
+      if (line && ctx.measureText(next).width > maxWidth) {
+        lines.push(line);
+        line = ch;
+      } else {
+        line = next;
+      }
+    }
+    lines.push(line);
+  }
+  return lines;
+};
+
+// 한 벡터(말풍선) 레이어를 캔버스에 래스터화한다.
+// iPad/Safari 에서 SVG foreignObject 를 canvas 에 drawImage 한 뒤 픽셀을 읽으면
+// SecurityError("The operation is insecure") 가 나는 경우가 있어, PSD export 에서는
+// SVG/Blob 경유 없이 순수 Canvas API 로 직접 그린다.
 const composeBubbleLayerCanvas = async (bubbles, typoPresets, canvasW, canvasH) => {
   const c = makeBlankCanvas(canvasW, canvasH);
   if (!Array.isArray(bubbles) || bubbles.length === 0) return c;
   const ctx = c.getContext('2d');
-
-  // SVG 한 덩어리로 빌드
-  const svgParts = [];
-  svgParts.push(`<svg xmlns="http://www.w3.org/2000/svg" width="${canvasW}" height="${canvasH}" viewBox="0 0 ${canvasW} ${canvasH}">`);
-  // 폰트 fallback: Pretendard 가 CSP 에 없을 수 있으니 sans-serif 까지 명시
-  svgParts.push(`<style>text,div{font-family:Pretendard,'Apple SD Gothic Neo','Noto Sans KR',sans-serif;}</style>`);
+  ctx.lineCap = 'round';
+  ctx.lineJoin = 'round';
 
   for (const b of bubbles) {
     const { type, x, y, w, h, tailTip, text, typoPresetId } = b;
@@ -939,16 +987,25 @@ const composeBubbleLayerCanvas = async (bubbles, typoPresets, canvasW, canvasH) 
     const fontSize = preset ? preset.size : (type === 'shout' ? 18 : 14);
     const fontWeight = preset ? preset.weight : (type === 'shout' ? 700 : 500);
 
+    ctx.save();
+    ctx.fillStyle = '#fff';
+    ctx.strokeStyle = '#1a1a1a';
+
     // tail
     if (tailTip) {
       if (type === 'thought') {
         const dots = 3;
+        ctx.lineWidth = 2;
+        ctx.setLineDash([]);
         for (let i = 0; i < dots; i++) {
           const t = (i + 1) / (dots + 1);
           const ex = cx + (tailTip.x - cx) * t;
           const ey = (y + h) + (tailTip.y - (y + h)) * t;
           const r = Math.max(1.5, 5 - i * 1.2);
-          svgParts.push(`<circle cx="${ex}" cy="${ey}" r="${r}" fill="#fff" stroke="#1a1a1a" stroke-width="2"/>`);
+          ctx.beginPath();
+          ctx.arc(ex, ey, r, 0, Math.PI * 2);
+          ctx.fill();
+          ctx.stroke();
         }
       } else {
         const ep = getBubbleEdgePoint(b, tailTip.x, tailTip.y);
@@ -956,51 +1013,63 @@ const composeBubbleLayerCanvas = async (bubbles, typoPresets, canvasW, canvasH) 
         const tlen = Math.sqrt(tdx * tdx + tdy * tdy) || 1;
         const hw = type === 'shout' ? 14 : 11;
         const perp = { x: -tdy / tlen, y: tdx / tlen };
-        const pts = `${ep.x + perp.x * hw},${ep.y + perp.y * hw} ${ep.x - perp.x * hw},${ep.y - perp.y * hw} ${tailTip.x},${tailTip.y}`;
-        const dash = type === 'whisper' ? ` stroke-dasharray="5,3"` : '';
-        svgParts.push(`<polygon points="${pts}" fill="#fff" stroke="#1a1a1a" stroke-width="2.5"${dash}/>`);
+        ctx.lineWidth = 2.5;
+        ctx.setLineDash(type === 'whisper' ? [5, 3] : []);
+        ctx.beginPath();
+        ctx.moveTo(ep.x + perp.x * hw, ep.y + perp.y * hw);
+        ctx.lineTo(ep.x - perp.x * hw, ep.y - perp.y * hw);
+        ctx.lineTo(tailTip.x, tailTip.y);
+        ctx.closePath();
+        ctx.fill();
+        ctx.stroke();
       }
     }
 
     // shape
+    ctx.fillStyle = '#fff';
+    ctx.strokeStyle = '#1a1a1a';
     if (type === 'normal' || type === 'whisper') {
-      const d = getRoundedRectPath(x, y, w, h, 108);
-      const dash = type === 'whisper' ? ` stroke-dasharray="7,4"` : '';
-      svgParts.push(`<path d="${d}" fill="#fff" stroke="#1a1a1a" stroke-width="2.5"${dash}/>`);
+      ctx.lineWidth = 2.5;
+      ctx.setLineDash(type === 'whisper' ? [7, 4] : []);
+      drawCanvasRoundedRectPath(ctx, x, y, w, h, 108);
+      ctx.fill();
+      ctx.stroke();
     } else if (type === 'thought') {
-      const d = getThoughtBubblePath(cx, cy, rx, ry);
-      svgParts.push(`<path d="${d}" fill="#fff" stroke="#1a1a1a" stroke-width="2.5"/>`);
+      ctx.lineWidth = 2.5;
+      ctx.setLineDash([]);
+      drawCanvasSpikyEllipsePath(ctx, cx, cy, rx, ry, 52, 0.84);
+      ctx.fill();
+      ctx.stroke();
     } else if (type === 'shout') {
-      const d = getShoutBubblePath(cx, cy, rx, ry);
-      svgParts.push(`<path d="${d}" fill="#fff" stroke="#1a1a1a" stroke-width="3.5" stroke-linejoin="miter"/>`);
+      ctx.lineWidth = 3.5;
+      ctx.setLineDash([]);
+      ctx.lineJoin = 'miter';
+      drawCanvasSpikyEllipsePath(ctx, cx, cy, rx, ry, 18, 0.62);
+      ctx.fill();
+      ctx.stroke();
+      ctx.lineJoin = 'round';
     }
 
-    // text (foreignObject 로 BubbleSVG 의 flex 중앙정렬 그대로 재현)
+    // text
     const tpx = type === 'shout' ? w * 0.22 : type === 'thought' ? w * 0.1 : 12;
     const tpy = type === 'shout' ? h * 0.22 : type === 'thought' ? h * 0.1 : 8;
-    const safeText = String(text || '')
-      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
-      .replace(/\n/g, '<br/>');
-    svgParts.push(
-      `<foreignObject x="${x}" y="${y}" width="${Math.max(1, w)}" height="${Math.max(1, h)}">` +
-      `<div xmlns="http://www.w3.org/1999/xhtml" style="width:100%;height:100%;display:flex;align-items:center;justify-content:center;padding:${tpy}px ${tpx}px;box-sizing:border-box;">` +
-      `<div style="font-size:${fontSize}px;font-weight:${fontWeight};color:#1a1a1a;word-break:break-word;text-align:center;line-height:1.4;white-space:pre-wrap;width:100%;">${safeText}</div>` +
-      `</div></foreignObject>`
-    );
-  }
-  svgParts.push('</svg>');
-
-  const svgBlob = new Blob([svgParts.join('')], { type: 'image/svg+xml;charset=utf-8' });
-  const url = URL.createObjectURL(svgBlob);
-  try {
-    await new Promise((resolve, reject) => {
-      const img = new Image();
-      img.onload = () => { ctx.drawImage(img, 0, 0); resolve(); };
-      img.onerror = (e) => reject(e || new Error('SVG 래스터화 실패'));
-      img.src = url;
-    });
-  } finally {
-    URL.revokeObjectURL(url);
+    const maxTextW = Math.max(1, w - tpx * 2);
+    const maxTextH = Math.max(1, h - tpy * 2);
+    ctx.setLineDash([]);
+    ctx.fillStyle = '#1a1a1a';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.font = `${fontWeight} ${fontSize}px Pretendard, Apple SD Gothic Neo, Noto Sans KR, sans-serif`;
+    const lineHeight = fontSize * 1.4;
+    let lines = wrapCanvasTextLines(ctx, text, maxTextW);
+    const maxLines = Math.max(1, Math.floor(maxTextH / lineHeight));
+    if (lines.length > maxLines) lines = lines.slice(0, maxLines);
+    const totalH = lines.length * lineHeight;
+    const startY = y + h / 2 - totalH / 2 + lineHeight / 2;
+    for (let i = 0; i < lines.length; i++) {
+      ctx.fillText(lines[i], x + w / 2, startY + i * lineHeight, maxTextW);
+    }
+    ctx.restore();
   }
   return c;
 };
@@ -1041,6 +1110,92 @@ const composeGuidesCanvas = (frame, canvasW, canvasH) => {
   ctx.moveTo(canvasW - frame.sideMargin + 0.5, 0);
   ctx.lineTo(canvasW - frame.sideMargin + 0.5, canvasH);
   ctx.stroke();
+  return c;
+};
+
+// ===================================================================
+//  PREVIEW — compose a single frame to one flat canvas (webtoon-style)
+//  편집 화면의 모습을 그대로 한 장의 이미지로 합성한다.
+//   - cut 블록: 흰 배경 (양옆 margin 은 gap 색)
+//   - gap 블록: gap 색 (편집기와 동일하게 #d9d9d9)
+//   - block.flatColor / block.gradient 적용
+//   - raster 레이어 (frame.layers 순서: 아래 → 위)
+//   - vector(말풍선) 레이어 (raster 위에 얹음)
+//  PSD export 와 달리 guide / Background 레이어는 없으며,
+//  composeBubbleLayerCanvas 가 async 라서 함수 전체도 async 다.
+// ===================================================================
+const composeFramePreviewCanvas = async (frame, frameLayerStores, bubblesByLayer, typoPresets) => {
+  const canvasW = Math.max(1, (frame.canvasWidth | 0));
+  const canvasH = Math.max(1, getFrameTotalHeight(frame.blocks) | 0);
+  const c = document.createElement('canvas');
+  c.width = canvasW;
+  c.height = canvasH;
+  const ctx = c.getContext('2d');
+
+  // 편집기와 동일한 색.  --cut: #ffffff / --gap: #d9d9d9
+  const CUT_BG = '#ffffff';
+  const GAP_BG = '#d9d9d9';
+
+  // 1) per-block 기본 배경 (cut 은 흰색 + 양옆 margin 은 gap 색, gap 은 통째로 gap 색)
+  let y = 0;
+  for (const b of frame.blocks) {
+    if (b.type === 'cut') {
+      const ml = b.marginLeft ?? frame.sideMargin;
+      const mr = b.marginRight ?? frame.sideMargin;
+      const bw = Math.max(10, canvasW - ml - mr);
+      // 먼저 전체를 gap 색으로 채우고
+      ctx.fillStyle = GAP_BG;
+      ctx.fillRect(0, y, canvasW, b.height);
+      // 가운데 cut 영역만 흰색으로 덮기
+      ctx.fillStyle = CUT_BG;
+      ctx.fillRect(ml, y, bw, b.height);
+    } else {
+      ctx.fillStyle = GAP_BG;
+      ctx.fillRect(0, y, canvasW, b.height);
+    }
+    y += b.height;
+  }
+
+  // 2) per-block flat color / gradient (cut 영역 안쪽에만 칠한다 — 편집기 .conti-block 과 동일)
+  y = 0;
+  for (const b of frame.blocks) {
+    const ml = b.type === 'cut' ? (b.marginLeft ?? frame.sideMargin) : 0;
+    const mr = b.type === 'cut' ? (b.marginRight ?? frame.sideMargin) : 0;
+    const bw = b.type === 'cut' ? Math.max(10, canvasW - ml - mr) : canvasW;
+    if (b.flatColor != null) {
+      ctx.fillStyle = grayToRgbStr(b.flatColor);
+      ctx.fillRect(ml, y, bw, b.height);
+    }
+    if (b.gradient) {
+      paintGradientToCtx(ctx, b.gradient, ml, y, bw, b.height);
+    }
+    y += b.height;
+  }
+
+  // 3) raster 레이어 (frame.layers 순서: 0 이 가장 아래)
+  //    redrawRegion 과 동일하게 layer.visible / opacity 를 반영한다.
+  for (const layer of frame.layers) {
+    if (!layer.visible) continue;
+    const opacity = Math.max(0, Math.min(1, (layer.opacity ?? 100) / 100));
+    if (layer.type === 'raster') {
+      const ls = frameLayerStores?.[layer.id];
+      if (!ls?.byBlock) continue;
+      const rasterCanvas = composeRasterLayerCanvas(frame, ls, canvasW, canvasH);
+      ctx.save();
+      ctx.globalAlpha = opacity;
+      ctx.drawImage(rasterCanvas, 0, 0);
+      ctx.restore();
+    } else if (layer.type === 'vector') {
+      const bubbles = bubblesByLayer?.[layer.id] || [];
+      if (bubbles.length === 0) continue;
+      const vectorCanvas = await composeBubbleLayerCanvas(bubbles, typoPresets, canvasW, canvasH);
+      ctx.save();
+      ctx.globalAlpha = opacity;
+      ctx.drawImage(vectorCanvas, 0, 0);
+      ctx.restore();
+    }
+  }
+
   return c;
 };
 
@@ -1167,8 +1322,19 @@ const triggerBytesDownload = (filename, bytes, mime = 'application/octet-stream'
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
   a.href = url; a.download = filename; a.style.display = 'none';
-  document.body.appendChild(a); a.click();
-  setTimeout(() => { document.body.removeChild(a); URL.revokeObjectURL(url); }, 100);
+  document.body.appendChild(a);
+  try {
+    a.click();
+  } catch (e) {
+    // iPad/Safari 일부 환경은 Blob 다운로드 a.click() 을 SecurityError 로 막는다.
+    // 새 탭으로 Blob URL 을 열어 사용자가 공유/저장할 수 있게 한다.
+    window.open(url, '_blank', 'noopener,noreferrer');
+  } finally {
+    setTimeout(() => {
+      try { document.body.removeChild(a); } catch (_) {}
+      URL.revokeObjectURL(url);
+    }, 1000);
+  }
 };
 
 // ---------- layer & frame factory ----------
@@ -1336,6 +1502,255 @@ const LayerRow = ({ layer, isActive, canMergeDown, onActivate, onToggleVisible,
           <button className="layer-action-btn danger" onClick={onDelete}>del</button>
         </div>
       )}
+    </div>
+  );
+};
+
+// ===================================================================
+//  PREVIEW MODAL — 콘티 미리보기
+//  실제 웹툰을 보듯 모든 frame을 하나의 세로 스크롤로 합쳐 보여준다.
+//  각 block 옆에 height 조절 chip 이 떠 있어 사이즈를 즉석에서 바꿀 수 있다.
+//  stroke 는 block-local 로 저장되어 있어 block 사이즈가 바뀌어도 자동으로 따라간다.
+//  (편집기의 updateBlockHeight 와 동일한 로직)
+// ===================================================================
+const PreviewBlockChip = ({ block, zoom, onChange }) => {
+  const top = block.top * zoom;
+  const height = Math.max(28, block.height * zoom);
+  const dec = () => onChange(String(Math.max(50, block.height - 50)));
+  const inc = () => onChange(String(Math.min(5000, block.height + 50)));
+  return (
+    <div className={`preview-chip type-${block.type}`}
+      style={{ top: `${top}px`, height: `${height}px` }}>
+      <div className={`preview-chip-bracket type-${block.type}`} />
+      <div className="preview-chip-panel">
+        <div className="preview-chip-head">
+          <span className={`preview-chip-tag ${block.type}`}>
+            {block.type === 'cut' ? `c${String(block.num).padStart(2, '0')}` : 'gap'}
+          </span>
+          <span className="preview-chip-kind">{block.type === 'cut' ? 'CUT' : 'GAP'}</span>
+        </div>
+        <div className="preview-chip-controls">
+          <button className="preview-chip-step" onClick={dec} title="-50px">▼</button>
+          <NumberInputWithDraft
+            className="preview-chip-num"
+            min={50} max={5000} step={50}
+            value={block.height}
+            onCommit={raw => onChange(raw)}
+          />
+          <span className="preview-chip-unit mono">px</span>
+          <button className="preview-chip-step" onClick={inc} title="+50px">▲</button>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+const PreviewFrameView = ({ frame, composedCanvas, isComposing, zoom, onUpdateBlockHeight }) => {
+  const canvasElRef = useRef(null);
+  const canvasW = Math.max(1, frame.canvasWidth | 0);
+  const canvasH = Math.max(1, getFrameTotalHeight(frame.blocks) | 0);
+
+  const blockLayout = useMemo(() => {
+    let y = 0, cutCounter = 0, gapCounter = 0;
+    return frame.blocks.map(b => {
+      const item = { ...b, top: y };
+      if (b.type === 'cut') { cutCounter++; item.num = cutCounter; }
+      else { gapCounter++; item.num = gapCounter; }
+      y += b.height;
+      return item;
+    });
+  }, [frame.blocks]);
+
+  // 합성된 캔버스 비트맵을 화면용 캔버스에 복사 (1회성)
+  useEffect(() => {
+    const el = canvasElRef.current;
+    if (!el) return;
+    if (composedCanvas) {
+      el.width = composedCanvas.width;
+      el.height = composedCanvas.height;
+      const ctx = el.getContext('2d');
+      ctx.clearRect(0, 0, el.width, el.height);
+      ctx.drawImage(composedCanvas, 0, 0);
+    } else {
+      // 합성 중일 때도 sizing 은 유지 (레이아웃 안 흔들리게)
+      if (el.width !== canvasW || el.height !== canvasH) {
+        el.width = canvasW;
+        el.height = canvasH;
+      }
+    }
+  }, [composedCanvas, canvasW, canvasH]);
+
+  // 표시 (CSS) 크기 = 자연 크기 × zoom
+  const dispW = canvasW * zoom;
+  const dispH = canvasH * zoom;
+
+  return (
+    <div className="preview-frame" style={{ width: `${dispW}px` }}>
+      <div className="preview-frame-label">
+        <span className="preview-frame-name">{frame.name}</span>
+        <span className="preview-frame-meta mono">{canvasW}×{canvasH}px</span>
+        {isComposing && <span className="preview-frame-busy mono">합성중…</span>}
+      </div>
+      <div className="preview-frame-canvas-wrap" style={{ width: `${dispW}px`, height: `${dispH}px` }}>
+        <canvas
+          ref={canvasElRef}
+          style={{ width: `${dispW}px`, height: `${dispH}px`, display: 'block' }}
+        />
+        {/* block size chips (overlay outside canvas, on right) */}
+        <div className="preview-chip-rail">
+          {blockLayout.map(b => (
+            <PreviewBlockChip
+              key={b.id}
+              block={b}
+              zoom={zoom}
+              onChange={v => onUpdateBlockHeight(b.id, v)}
+            />
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+};
+
+const PreviewModal = ({
+  open, frames, strokesByFrameRef, bubblesByLayer, typoPresets,
+  onClose, onUpdateBlockHeightInFrame,
+}) => {
+  // canvasW * zoom 이 화면에 합리적이도록 기본값을 정한다. 일반적인 690px 캔버스를
+  // iPad 세로(~768px)에서 60% 로 보면 414px, 양옆 chip rail(~200px)까지 합쳐도 614px 라 잘 맞는다.
+  const [zoom, setZoom] = useState(0.6);
+  // {frameId: HTMLCanvasElement | null}
+  const [frameCanvases, setFrameCanvases] = useState({});
+  // {frameId: true} — 현재 이 프레임이 합성 중인지
+  const [composingMap, setComposingMap] = useState({});
+
+  // 합성 디바운스 타이머 + 마지막으로 합성에 사용한 blocks 참조
+  const composeTimersRef = useRef({});  // {frameId: timeoutId}
+  const lastComposedBlocksRef = useRef({}); // {frameId: blocks ref}
+  const composeTokenRef = useRef({}); // {frameId: token} — 합성 도중 더 새 요청이 오면 기존 결과 무시
+  const aliveRef = useRef(true);
+
+  useEffect(() => {
+    aliveRef.current = true;
+    return () => { aliveRef.current = false; };
+  }, []);
+
+  // 단일 프레임 합성 (async). 합성 중간에 같은 프레임에 새 요청이 들어오면
+  // composeTokenRef 가 달라지므로 결과를 버린다.
+  const composeFrame = useCallback(async (frame) => {
+    const fid = frame.id;
+    const token = (composeTokenRef.current[fid] || 0) + 1;
+    composeTokenRef.current[fid] = token;
+    setComposingMap(prev => prev[fid] ? prev : { ...prev, [fid]: true });
+    try {
+      const c = await composeFramePreviewCanvas(
+        frame,
+        strokesByFrameRef.current[fid] || {},
+        bubblesByLayer,
+        typoPresets,
+      );
+      if (!aliveRef.current) return;
+      if (composeTokenRef.current[fid] !== token) return; // 더 새 요청이 들어왔음
+      setFrameCanvases(prev => ({ ...prev, [fid]: c }));
+    } catch (e) {
+      console.error('[preview] compose failed', e);
+    } finally {
+      if (aliveRef.current && composeTokenRef.current[fid] === token) {
+        setComposingMap(prev => {
+          if (!prev[fid]) return prev;
+          const next = { ...prev }; delete next[fid]; return next;
+        });
+      }
+    }
+  }, [strokesByFrameRef, bubblesByLayer, typoPresets]);
+
+  // open 될 때 + frames / bubbles / typoPresets 가 바뀔 때, 변경된 프레임만 재합성한다.
+  // (frame.blocks 가 같은 참조면 스킵한다 — 다른 프레임의 변경에 의한 setFrames 에는 반응 X)
+  useEffect(() => {
+    if (!open) return;
+    for (const f of frames) {
+      const lastBlocks = lastComposedBlocksRef.current[f.id];
+      // bubbles / typoPresets 가 바뀌었을 때도 다시 합성해야 하므로, deps 자체에 같이 묶어둠.
+      // 여기서는 blocks 만 비교해 같으면 재합성을 살짝 미룬다.
+      if (lastBlocks === f.blocks && frameCanvases[f.id]) continue;
+      lastComposedBlocksRef.current[f.id] = f.blocks;
+      // 디바운스 (블록 사이즈를 휠/슬라이드로 빠르게 바꿀 때 폭주 방지)
+      clearTimeout(composeTimersRef.current[f.id]);
+      composeTimersRef.current[f.id] = setTimeout(() => composeFrame(f), 80);
+    }
+    // 이제 frames 에 없는 frame 의 캔버스는 정리
+    return () => {
+      // cleanup: 모든 디바운스 타이머는 다음 effect 에서 다시 잡으므로 여기선 손대지 않음
+    };
+  }, [open, frames, bubblesByLayer, typoPresets, composeFrame, frameCanvases]);
+
+  // 열렸을 때 → 모든 프레임에 대해 한 번씩 강제 합성 (bubblesByLayer 가 안 바뀌더라도)
+  useEffect(() => {
+    if (!open) return;
+    // 한 번이라도 합성한 적 없는 프레임은 즉시 큐잉
+    for (const f of frames) {
+      if (!frameCanvases[f.id] && !composingMap[f.id]) {
+        clearTimeout(composeTimersRef.current[f.id]);
+        composeTimersRef.current[f.id] = setTimeout(() => composeFrame(f), 0);
+      }
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open]);
+
+  // 닫을 때 타이머 정리
+  useEffect(() => {
+    if (open) return;
+    for (const tid of Object.values(composeTimersRef.current)) clearTimeout(tid);
+    composeTimersRef.current = {};
+  }, [open]);
+
+  // ESC 로 닫기
+  useEffect(() => {
+    if (!open) return;
+    const onKey = e => { if (e.key === 'Escape') onClose?.(); };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [open, onClose]);
+
+  if (!open) return null;
+
+  const zoomPct = Math.round(zoom * 100);
+
+  return (
+    <div className="preview-overlay" role="dialog" aria-modal="true" onContextMenu={e => e.preventDefault()}>
+      <header className="preview-header">
+        <div className="preview-title">
+          <span className="preview-title-icon">▶</span>
+          <span>미리보기</span>
+          <span className="preview-title-meta mono">{frames.length} frames</span>
+        </div>
+        <div className="preview-header-tools">
+          <div className="preview-zoom">
+            <span className="preview-zoom-label mono">zoom</span>
+            <input
+              type="range" min="20" max="120" step="5"
+              value={zoomPct}
+              onChange={e => setZoom(Math.max(0.2, Math.min(1.2, parseInt(e.target.value, 10) / 100)))}
+            />
+            <span className="preview-zoom-val mono">{zoomPct}%</span>
+          </div>
+          <button className="preview-close" onClick={onClose} title="닫기 (Esc)">✕ 닫기</button>
+        </div>
+      </header>
+      <div className="preview-scroll" onContextMenu={e => e.preventDefault()}>
+        <div className="preview-stack">
+          {frames.map(f => (
+            <PreviewFrameView
+              key={f.id}
+              frame={f}
+              composedCanvas={frameCanvases[f.id] || null}
+              isComposing={!!composingMap[f.id]}
+              zoom={zoom}
+              onUpdateBlockHeight={(blockId, v) => onUpdateBlockHeightInFrame(f.id, blockId, v)}
+            />
+          ))}
+        </div>
+      </div>
     </div>
   );
 };
@@ -2075,19 +2490,17 @@ const STYLES = `
 }
 .conti-block-row:hover { border-color: var(--ink-2); }
 .conti-block-row.type-cut {
-  background: linear-gradient(90deg, rgba(15,15,15,0.18) 0 20px, color-mix(in srgb, var(--paper) 88%, #fff) 20px 100%);
-  border-color: rgba(15,15,15,0.32);
-  box-shadow: inset 3px 0 0 var(--ink), 0 1px 0 rgba(15,15,15,0.04);
+  background: linear-gradient(90deg, rgba(15,15,15,0.06) 0 18px, var(--paper) 18px 100%);
+  border-color: rgba(15,15,15,0.16);
 }
 .conti-block-row.type-cut:hover {
   border-color: var(--ink);
-  background: linear-gradient(90deg, rgba(15,15,15,0.24) 0 20px, color-mix(in srgb, var(--paper) 76%, var(--bg-panel)) 20px 100%);
-  box-shadow: inset 4px 0 0 var(--ink), 0 1px 0 rgba(15,15,15,0.06);
+  background: linear-gradient(90deg, rgba(15,15,15,0.09) 0 18px, color-mix(in srgb, var(--paper) 82%, var(--bg-panel)) 18px 100%);
 }
 .conti-block-row.type-gap {
-  background: linear-gradient(90deg, rgba(15,15,15,0.045) 0 16px, rgba(15,15,15,0.025) 16px 100%);
-  border-color: rgba(15,15,15,0.13);
-  box-shadow: none;
+  background: linear-gradient(90deg, rgba(196,58,44,0.16) 0 18px, rgba(196,58,44,0.06) 18px 100%);
+  border-color: rgba(196,58,44,0.42);
+  box-shadow: inset 0 0 0 1px rgba(196,58,44,0.08);
 }
 .conti-block-row.type-gap:hover {
   border-color: var(--accent);
@@ -2103,21 +2516,15 @@ const STYLES = `
 .conti-block-tag {
   font-family: 'JetBrains Mono', monospace; font-size: 9px; letter-spacing: 0.06em;
   text-transform: uppercase; padding: 2px 5px; border-radius: 3px; flex-shrink: 0;
-  border: 1px solid transparent;
 }
-.conti-block-tag.cut {
-  background: var(--ink); color: var(--paper); border-color: var(--ink);
-  font-weight: 800; box-shadow: 0 1px 0 rgba(15,15,15,0.14);
-}
-.conti-block-tag.gap {
-  background: rgba(15,15,15,0.075); color: var(--ink-2); border-color: rgba(15,15,15,0.08);
-}
+.conti-block-tag.cut { background: var(--ink); color: var(--paper); }
+.conti-block-tag.gap { background: var(--accent); color: var(--paper); }
 .conti-block-kind {
   font-family: 'JetBrains Mono', monospace; font-size: 9px; letter-spacing: 0.08em;
   text-transform: uppercase; padding: 2px 4px; border-radius: 3px; flex-shrink: 0;
 }
-.conti-block-kind.type-cut { background: rgba(15,15,15,0.12); color: var(--ink); font-weight: 700; }
-.conti-block-kind.type-gap { background: rgba(15,15,15,0.055); color: var(--muted); }
+.conti-block-kind.type-cut { background: rgba(15,15,15,0.08); color: var(--ink); }
+.conti-block-kind.type-gap { background: rgba(196,58,44,0.12); color: var(--accent); }
 .conti-block-row input {
   width: 100%; min-width: 0; flex: 1; padding: 2px 4px; font-family: 'JetBrains Mono', monospace; font-size: 11px;
   background: transparent; border: 1px solid transparent; border-radius: 3px; text-align: right; color: var(--ink);
@@ -2153,13 +2560,8 @@ const STYLES = `
   transition: border-color 0.12s ease, background 0.12s ease, box-shadow 0.12s ease;
 }
 .conti-block-margin-row.type-cut {
-  background: linear-gradient(90deg, rgba(15,15,15,0.12) 0 20px, var(--bg-panel) 20px 100%);
-  border-color: rgba(15,15,15,0.32);
-  box-shadow: inset 3px 0 0 var(--ink);
-}
-.conti-block-margin-row.type-gap {
-  background: linear-gradient(90deg, rgba(15,15,15,0.035) 0 16px, var(--bg-panel) 16px 100%);
-  border-color: rgba(15,15,15,0.13);
+  background: linear-gradient(90deg, rgba(15,15,15,0.06) 0 18px, var(--bg-panel) 18px 100%);
+  border-color: rgba(15,15,15,0.16);
 }
 .conti-margin-label {
   font-family: 'JetBrains Mono', monospace; font-size: 9px; letter-spacing: 0.06em;
@@ -2486,6 +2888,202 @@ const STYLES = `
 
 @media (max-width: 900px) { .conti-sidebar.right { display: none; } }
 @media (max-width: 700px) { .conti-sidebar { width: 200px; flex: 0 0 200px; } .conti-tool input[type="range"] { width: 70px; } }
+
+/* ===== PREVIEW MODAL ===== */
+.conti-icon-btn.preview {
+  background: var(--ink); color: var(--paper); border-color: var(--ink);
+}
+.conti-icon-btn.preview:hover:not(:disabled) {
+  background: var(--accent); border-color: var(--accent); color: var(--paper);
+}
+
+.preview-overlay {
+  position: fixed; inset: 0; z-index: 9999;
+  background: #2c2a26;
+  display: flex; flex-direction: column;
+  -webkit-user-select: none; user-select: none;
+  -webkit-touch-callout: none;
+}
+.preview-header {
+  flex: 0 0 56px; height: 56px;
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 0 22px;
+  background: var(--bg); border-bottom: 1px solid var(--line); color: var(--ink);
+}
+.preview-title {
+  display: flex; align-items: center; gap: 10px;
+  font-weight: 700; font-size: 15px; letter-spacing: -0.01em;
+}
+.preview-title-icon {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 22px; height: 22px; border-radius: 50%;
+  background: var(--accent); color: var(--paper);
+  font-size: 9px; padding-left: 2px;
+}
+.preview-title-meta {
+  font-size: 10px; letter-spacing: 0.08em; color: var(--muted);
+  text-transform: uppercase; margin-left: 4px;
+}
+.preview-header-tools { display: flex; align-items: center; gap: 18px; }
+.preview-zoom { display: flex; align-items: center; gap: 8px; }
+.preview-zoom-label {
+  font-size: 10px; letter-spacing: 0.08em; color: var(--muted); text-transform: uppercase;
+}
+.preview-zoom input[type="range"] {
+  -webkit-appearance: none; appearance: none;
+  width: 140px; height: 4px; background: var(--line); border-radius: 999px; outline: none;
+}
+.preview-zoom input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none; appearance: none; width: 14px; height: 14px;
+  background: var(--ink); border-radius: 50%; cursor: pointer;
+  border: 2px solid var(--paper); box-shadow: 0 0 0 1px var(--ink);
+}
+.preview-zoom-val {
+  min-width: 36px; text-align: right; font-size: 11px; color: var(--ink);
+}
+.preview-close {
+  padding: 7px 14px; border-radius: 6px;
+  border: 1px solid var(--line); background: var(--paper);
+  font-family: 'JetBrains Mono', monospace; font-size: 11px;
+  letter-spacing: 0.04em; color: var(--ink); transition: all 0.12s;
+}
+.preview-close:hover {
+  background: var(--accent); border-color: var(--accent); color: var(--paper);
+}
+
+.preview-scroll {
+  flex: 1 1 auto; overflow: auto;
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior: contain;
+  touch-action: pan-x pan-y;
+  background: #2c2a26;
+}
+.preview-stack {
+  display: flex; flex-direction: column; align-items: center;
+  gap: 30px; padding: 32px 16px 80px;
+  min-width: max-content;
+}
+
+.preview-frame {
+  display: flex; flex-direction: column; gap: 8px;
+  position: relative;
+}
+.preview-frame-label {
+  display: flex; align-items: baseline; gap: 10px;
+  color: #e3ddc9; font-size: 12px; letter-spacing: 0.02em;
+  padding: 0 4px;
+}
+.preview-frame-name { font-weight: 600; font-size: 13px; }
+.preview-frame-meta { font-size: 10px; color: #948f81; letter-spacing: 0.06em; text-transform: uppercase; }
+.preview-frame-busy {
+  font-size: 9px; letter-spacing: 0.1em;
+  color: var(--accent); text-transform: uppercase;
+  padding: 1px 6px; border-radius: 3px;
+  background: rgba(196, 58, 44, 0.15);
+}
+.preview-frame-canvas-wrap {
+  position: relative;
+  background: var(--cut, #ffffff);
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.45), 0 0 0 1px rgba(255, 255, 255, 0.05);
+  border-radius: 2px;
+}
+.preview-frame-canvas-wrap canvas {
+  display: block; image-rendering: -webkit-optimize-contrast;
+  -webkit-user-drag: none;
+  -webkit-touch-callout: none;
+  user-select: none;
+  pointer-events: none; /* 캔버스 위 클릭이 chip rail 까지 안 잡히게 */
+}
+
+/* chip rail: 우측에 절대 위치로 떠 있는 block 조절 패널 */
+.preview-chip-rail {
+  position: absolute; top: 0; left: 100%; bottom: 0;
+  width: 200px;
+  pointer-events: none;
+}
+.preview-chip {
+  position: absolute; left: 0; right: 0;
+  display: flex; align-items: stretch;
+  pointer-events: none;
+}
+.preview-chip-bracket {
+  flex: 0 0 16px;
+  margin: 0 8px 0 6px;
+  position: relative;
+  pointer-events: none;
+  background-image: linear-gradient(rgba(255,255,255,0.35), rgba(255,255,255,0.35));
+  background-size: 1px 100%;
+  background-repeat: no-repeat;
+  background-position: 0 0;
+}
+.preview-chip-bracket::before,
+.preview-chip-bracket::after {
+  content: ''; position: absolute; left: 0; width: 12px; height: 1px;
+  background: rgba(255, 255, 255, 0.45);
+}
+.preview-chip-bracket::before { top: 0; }
+.preview-chip-bracket::after  { bottom: 0; }
+.preview-chip.type-cut .preview-chip-bracket { background-image: linear-gradient(rgba(255,255,255,0.6), rgba(255,255,255,0.6)); }
+.preview-chip.type-gap .preview-chip-bracket { background-image: linear-gradient(rgba(255,255,255,0.28), rgba(255,255,255,0.28)); }
+.preview-chip.type-cut .preview-chip-bracket::before,
+.preview-chip.type-cut .preview-chip-bracket::after { background: rgba(255,255,255,0.6); }
+.preview-chip.type-gap .preview-chip-bracket::before,
+.preview-chip.type-gap .preview-chip-bracket::after { background: rgba(255,255,255,0.28); }
+
+.preview-chip-panel {
+  flex: 1; align-self: center;
+  display: flex; flex-direction: column; gap: 4px;
+  padding: 6px 8px;
+  background: rgba(253, 251, 245, 0.95);
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  border-radius: 6px;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.35);
+  pointer-events: all;
+  min-width: 0;
+}
+.preview-chip-head { display: flex; align-items: center; gap: 5px; }
+.preview-chip-tag {
+  display: inline-flex; align-items: center; justify-content: center;
+  height: 16px; padding: 0 5px;
+  font-family: 'JetBrains Mono', monospace; font-size: 9px;
+  letter-spacing: 0.05em; border-radius: 3px;
+  background: var(--ink); color: var(--paper);
+}
+.preview-chip-tag.gap { background: var(--accent); }
+.preview-chip-kind {
+  font-family: 'JetBrains Mono', monospace; font-size: 8px;
+  letter-spacing: 0.1em; color: var(--muted); text-transform: uppercase;
+}
+.preview-chip-controls {
+  display: flex; align-items: center; gap: 2px;
+}
+.preview-chip-step {
+  width: 18px; height: 22px;
+  display: inline-flex; align-items: center; justify-content: center;
+  background: var(--paper); border: 1px solid var(--line); border-radius: 3px;
+  font-family: 'JetBrains Mono', monospace; font-size: 9px; line-height: 1; color: var(--ink);
+  transition: all 0.12s;
+  flex-shrink: 0;
+}
+.preview-chip-step:hover { background: var(--bg-panel); border-color: var(--ink-2); }
+.preview-chip-step:active { background: var(--line); }
+.preview-chip-num {
+  width: 44px; padding: 3px 4px;
+  font-family: 'JetBrains Mono', monospace; font-size: 11px;
+  background: var(--paper); border: 1px solid var(--line); border-radius: 3px;
+  text-align: right; color: var(--ink);
+}
+.preview-chip-num:focus { outline: none; border-color: var(--ink); }
+.preview-chip-unit {
+  font-size: 9px; color: var(--muted); margin-left: 1px;
+}
+
+@media (max-width: 700px) {
+  .preview-chip-rail { width: 160px; }
+  .preview-chip-num { width: 36px; }
+  .preview-header { padding: 0 14px; }
+  .preview-zoom input[type="range"] { width: 90px; }
+}
 `;
 
 // ---------- GradientColorHandle ----------
@@ -3125,6 +3723,8 @@ export default function ContiProgram() {
   //  PROJECT (save/load) state
   // ===================================================================
   const [saveDialogOpen, setSaveDialogOpen] = useState(false);
+  // 미리보기 모달 (모든 frame을 하나의 세로 스크롤로 합쳐 보여주고 block 사이즈 조절 가능)
+  const [previewOpen, setPreviewOpen] = useState(false);
   const [currentProjectId, setCurrentProjectId] = useState(null); // 저장된 프로젝트 id 또는 null
   const [currentProjectName, setCurrentProjectName] = useState('');
   // saveStatus: 'idle' | 'saving' | 'saved' | 'error' | 'dirty'
@@ -4715,40 +5315,55 @@ export default function ContiProgram() {
     setFrames(arr => arr.map(f => f.id === selectedFrameId ? { ...f, blocks: newBlocks } : f));
   };
 
+  // frame-agnostic 버전 — 프리뷰 등 selectedFrame 이 아닌 다른 frame 의
+  // block height 도 동일 로직으로 갱신한다. (stroke 는 block-local 저장이므로
+  // top 이 밀리는 만큼 자연스럽게 따라오고, bubble 만 dy 만큼 보정한다.)
+  const updateBlockHeightInFrame = useCallback((frameId, blockId, value) => {
+    setFrames(prevFrames => {
+      const frame = prevFrames.find(f => f.id === frameId);
+      if (!frame) return prevFrames;
+      const h = clampBlockHeightForFrame(frame, blockId, parseInt(value, 10) || 200);
+      const target = frame.blocks.find(b => b.id === blockId);
+      if (!target || target.height === h) return prevFrames;
+
+      // 같은 frame 의 vector(말풍선) 레이어만 dy 만큼 이동.
+      const oldTops = computeBlockTops(frame.blocks);
+      const newBlocks = frame.blocks.map(b => b.id === blockId ? { ...b, height: h } : b);
+      const newTops = computeBlockTops(newBlocks);
+      const frameLayerIds = new Set(frame.layers.map(l => String(l.id)));
+      setBubblesByLayer(prev => {
+        const updated = { ...prev };
+        let anyChanged = false;
+        for (const layerId of Object.keys(updated)) {
+          if (!frameLayerIds.has(layerId)) continue;
+          let layerChanged = false;
+          const nextArr = (updated[layerId] || []).map(bubble => {
+            const ownerBlockId = findBubbleBlockId(bubble, frame.blocks, oldTops);
+            if (ownerBlockId === null) return bubble;
+            const dy = (newTops[ownerBlockId] ?? 0) - (oldTops[ownerBlockId] ?? 0);
+            if (dy === 0) return bubble;
+            layerChanged = true;
+            return {
+              ...bubble,
+              y: bubble.y + dy,
+              tailTip: bubble.tailTip ? { x: bubble.tailTip.x, y: bubble.tailTip.y + dy } : null,
+            };
+          });
+          if (layerChanged) { updated[layerId] = nextArr; anyChanged = true; }
+        }
+        return anyChanged ? updated : prev;
+      });
+
+      return prevFrames.map(f => f.id === frameId ? { ...f, blocks: newBlocks } : f);
+    });
+    // setFrames / setBubblesByLayer 가 변하면 autosave useEffect 가 자동으로 트리거된다.
+    // (frames / bubblesByLayer 의존성)
+  }, []);
+
   const updateBlockHeight = (blockId, value) => {
     if (!selectedFrame) return;
     settleCanvasInteraction('before-update-block-height');
-    const h = clampBlockHeightForFrame(selectedFrame, blockId, parseInt(value, 10) || 200);
-    const target = selectedFrame.blocks.find(b => b.id === blockId);
-    if (!target || target.height === h) return;
-
-    // 변경된 block 아래에 있는 block들의 top이 밀림 → 그 block에 종속된 말풍선도 함께 이동
-    const oldTops = computeBlockTops(selectedFrame.blocks);
-    const newBlocks = selectedFrame.blocks.map(b => b.id === blockId ? { ...b, height: h } : b);
-    const newTops = computeBlockTops(newBlocks);
-    const selectedLayerIds = new Set(selectedFrame.layers.map(l => String(l.id)));
-    setBubblesByLayer(prev => {
-      const updated = { ...prev };
-      for (const layerId of Object.keys(updated)) {
-        if (!selectedLayerIds.has(layerId)) continue;
-        updated[layerId] = (updated[layerId] || []).map(bubble => {
-          const ownerBlockId = findBubbleBlockId(bubble, selectedFrame.blocks, oldTops);
-          if (ownerBlockId === null) return bubble;
-          const dy = (newTops[ownerBlockId] ?? 0) - (oldTops[ownerBlockId] ?? 0);
-          if (dy === 0) return bubble;
-          return {
-            ...bubble,
-            y: bubble.y + dy,
-            tailTip: bubble.tailTip ? { x: bubble.tailTip.x, y: bubble.tailTip.y + dy } : null,
-          };
-        });
-      }
-      return updated;
-    });
-
-    setFrames(arr => arr.map(f => f.id === selectedFrameId
-      ? { ...f, blocks: f.blocks.map(b => b.id === blockId ? { ...b, height: h } : b) }
-      : f));
+    updateBlockHeightInFrame(selectedFrameId, blockId, value);
   };
 
   const updateBlockMargin = (blockId, side, value) => {
@@ -5815,6 +6430,8 @@ export default function ContiProgram() {
             <button className="conti-icon-btn" onClick={undo}
               disabled={!selectedFrame || (lassoRef.current.phase !== 'idle' && !(lassoRef.current.transformHistory?.length > 0))}>↶ undo</button>
           )}
+          <button className="conti-icon-btn preview" onClick={() => setPreviewOpen(true)}
+            disabled={!frames.length} title="모든 frame을 합쳐서 미리보기">▶ 미리보기</button>
           <button className="conti-icon-btn" onClick={() => setSaveDialogOpen(true)}
             title="프로젝트 저장 / 불러오기">📁 project</button>
           <button className="conti-icon-btn danger" onClick={clearAll} disabled={!selectedFrame}>clear all</button>
@@ -6302,6 +6919,16 @@ export default function ContiProgram() {
         hasFrames={frames.length > 0}
         frameCount={frames.length}
         storageBackend={storageBackend}
+      />
+
+      <PreviewModal
+        open={previewOpen}
+        frames={frames}
+        strokesByFrameRef={strokesByFrameRef}
+        bubblesByLayer={bubblesByLayer}
+        typoPresets={typoPresets}
+        onClose={() => setPreviewOpen(false)}
+        onUpdateBlockHeightInFrame={updateBlockHeightInFrame}
       />
     </div>
   );
