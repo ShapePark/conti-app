@@ -25,6 +25,18 @@ const BITMAP_GROW_CHUNK = 400;
 const DPR_CAP = 2;
 const SAFE_CANVAS_MAX_AREA = 16_000_000; // iOS/Safari 계열에서 큰 canvas가 빈 화면이 되는 것을 막기 위한 보수적 한계
 const SAFE_CANVAS_MAX_SIDE = 16_000;
+// ── overlay(라이브 스트로크/올가미/말풍선 드래프트) 전용 백킹스토어 상한 ──────────────
+// 그리는 동안 매 애니메이션 프레임마다 GPU로 재합성되는 유일한 캔버스가 overlay 다.
+// 기존엔 overlay 가 main 과 같은 "프레임 전체 크기" 라서, cut+gap 이 많아져 프레임이
+// 길어질수록 overlay 가 한계치(≈64MB)까지 커지고 → 매 프레임 그 거대한 텍스처를
+// 재합성하느라 iPad 가 못 따라가서 렉이 걸렸다 (12개 부근에서 16M 픽셀 한계 도달).
+// overlay 는 "진행 중인 한 획" 만 잠깐 보여주는 일회성 레이어이므로 해상도가 낮아도
+// 무방하다. 백킹스토어 픽셀 수를 블록 개수와 무관하게 일정하게 묶어두면 미리보기
+// 재합성 비용이 고정되어 30개 이상이어도 렉이 없다. (CSS 크기는 전체 프레임 그대로 →
+// 좌표 매핑/히트영역/레이어링은 전혀 영향 없음. 커밋된 획은 별도 block bitmap 에
+// 원래 해상도로 그려지므로 최종 작업물 화질도 그대로 유지된다.)
+const OVERLAY_MAX_AREA = 4_000_000;
+const OVERLAY_MAX_SIDE = 8_192; // 구형 iPad GPU 단일 텍스처 한계(8192) → 타일링(소프트웨어 경로) 회피
 const MAX_FRAME_HEIGHT = 30_000;
 const RDP_EPSILON = 0.5;
 
@@ -68,6 +80,17 @@ const getSafeCanvasDpr = (logicalWidth, logicalHeight, preferredDpr = 1) => {
   const preferred = Math.max(0.1, Number(preferredDpr) || 1);
   const byArea = Math.sqrt(SAFE_CANVAS_MAX_AREA / (w * h));
   const bySide = SAFE_CANVAS_MAX_SIDE / Math.max(w, h);
+  return Math.max(0.1, Math.min(preferred, byArea, bySide));
+};
+
+// overlay 전용 DPR. main 보다 훨씬 작은 백킹스토어 상한(OVERLAY_MAX_*)을 적용해서
+// 프레임이 아무리 길어져도 overlay 픽셀 수가 일정 이하로 유지되게 한다.
+const getSafeOverlayDpr = (logicalWidth, logicalHeight, preferredDpr = 1) => {
+  const w = Math.max(1, Number(logicalWidth) || 1);
+  const h = Math.max(1, Number(logicalHeight) || 1);
+  const preferred = Math.max(0.1, Number(preferredDpr) || 1);
+  const byArea = Math.sqrt(OVERLAY_MAX_AREA / (w * h));
+  const bySide = OVERLAY_MAX_SIDE / Math.max(w, h);
   return Math.max(0.1, Math.min(preferred, byArea, bySide));
 };
 
@@ -342,7 +365,7 @@ const paintGradientToCtx = (ctx, g, x, y, width, height) => {
 };
 
 const SCHEMA_VERSION = 1;
-const APP_VERSION = 'conti.v34-preview';
+const APP_VERSION = 'conti.v35-preview';
 const DB_NAME = 'conti_program_db';
 const DB_STORE = 'projects';
 const AUTOSAVE_ID = '__autosave__';
@@ -3251,6 +3274,7 @@ const FrameView = React.memo(forwardRef(function FrameView({
   const canvasRef = useRef(null);
   const overlayRef = useRef(null);
   const dprRef = useRef(1);
+  const overlayDprRef = useRef(1);
   const canvasLayoutRef = useRef({
     width: 0, height: 0, dpr: 1, blocks: [],
   });
@@ -3372,8 +3396,13 @@ const FrameView = React.memo(forwardRef(function FrameView({
 
       const oc = overlayRef.current;
       if (oc) {
-        const nextPixelW = Math.max(1, Math.round(frame.canvasWidth * dpr));
-        const nextPixelH = Math.max(1, Math.round(totalHeight * dpr));
+        // overlay 는 main 과 달리 "작고 일정한" 백킹스토어를 갖는다 (OVERLAY_MAX_* 참고).
+        // 매 프레임 재합성되는 유일한 캔버스이므로, 프레임 높이가 커져도 픽셀 수가
+        // 늘지 않게 별도 dpr 로 크기를 잡는다. CSS 크기는 전체 프레임 그대로 둔다.
+        const overlayDpr = getSafeOverlayDpr(frame.canvasWidth, totalHeight, dpr);
+        overlayDprRef.current = overlayDpr;
+        const nextPixelW = Math.max(1, Math.round(frame.canvasWidth * overlayDpr));
+        const nextPixelH = Math.max(1, Math.round(totalHeight * overlayDpr));
         if (oc.width !== nextPixelW) oc.width = nextPixelW;
         if (oc.height !== nextPixelH) oc.height = nextPixelH;
         oc.style.width = `${frame.canvasWidth}px`;
@@ -3444,6 +3473,7 @@ const FrameView = React.memo(forwardRef(function FrameView({
     getMainCanvas: () => canvasRef.current,
     getOverlayCanvas: () => overlayRef.current,
     getDpr: () => dprRef.current,
+    getOverlayDpr: () => overlayDprRef.current,
     clearOverlay: () => {
       const oc = overlayRef.current;
       if (!oc) return;
@@ -4100,7 +4130,7 @@ export default function ContiProgram() {
     if (mode === 'create') {
       const fref = frameRefs.current[frameId];
       if (!fref) return;
-      const oc = fref.getOverlayCanvas(), dpr = fref.getDpr();
+      const oc = fref.getOverlayCanvas(), dpr = fref.getOverlayDpr();
       if (!oc) return;
       const ctx = oc.getContext('2d');
       ctx.clearRect(0, 0, oc.width, oc.height);
@@ -4172,7 +4202,7 @@ export default function ContiProgram() {
     if (!fref) return;
     const oc = fref.getOverlayCanvas();
     if (!oc) return;
-    const dpr = fref.getDpr();
+    const dpr = fref.getOverlayDpr();
     const ctx = oc.getContext('2d');
     ctx.clearRect(0, 0, oc.width, oc.height);
     const lasso = lassoRef.current;
@@ -4821,7 +4851,7 @@ export default function ContiProgram() {
       // pointermove 마다 frames.find / blocks.reduce 다시 안 하도록 캐싱
       const fref = frameRefs.current[frameId];
       drawingRef.current = {
-        frameId, layerId: activeLayerId, frame, dpr: fref?.getDpr() || 1,
+        frameId, layerId: activeLayerId, frame, dpr: fref?.getOverlayDpr() || 1,
         pointerId: e.pointerId, pointerType: e.pointerType, overlayEl, strokeRef: currentStrokeRef,
         pendingLivePoints: [], liveRafId: null, liveLastPoint: null,
       };
@@ -4865,7 +4895,7 @@ export default function ContiProgram() {
     const p = getCanvasPoint(e, overlayEl, frame);
     const fref = frameRefs.current[frameId];
     drawingRef.current = {
-      frameId, layerId: activeLayerId, frame, dpr: fref?.getDpr() || 1,
+      frameId, layerId: activeLayerId, frame, dpr: fref?.getOverlayDpr() || 1,
       pointerId: e.pointerId, pointerType: e.pointerType, overlayEl, strokeRef: currentStrokeRef,
       pendingLivePoints: [], liveRafId: null, liveLastPoint: null,
     };
